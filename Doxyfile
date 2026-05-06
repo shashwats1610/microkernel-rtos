@@ -1,0 +1,12 @@
+PROJECT_NAME           = "Microkernel RTOS"
+PROJECT_NUMBER         = 0.1
+OUTPUT_DIRECTORY       = .
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+RECURSIVE              = YES
+INPUT                  = include src README.md docs
+FILE_PATTERNS          = *.h *.c *.md
+EXTRACT_ALL            = YES
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = YES
+USE_MFILE_AS_MAINPAGE  = README.md

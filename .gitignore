@@ -1,0 +1,11 @@
+build/
+*.o
+*.elf
+*.bin
+*.map
+*.lst
+*.d
+.DS_Store
+html/
+latex/
+doxygen.warn
