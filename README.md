@@ -2,6 +2,23 @@
 
 Interview-oriented preemptive RTOS for **ARM Cortex-M4** (STM32F407-class), with a minimal bring-up path under **QEMU** (`netduino2`) for CI-friendly smoke testing.
 
+**Repository:** [github.com/shashwats1610/microkernel-rtos](https://github.com/shashwats1610/microkernel-rtos)
+
+## About this project
+
+This is a **from-scratch**, **portfolio-grade** real-time kernel aimed at **embedded systems interviews** (startups and teams that care about scheduling, context switch cost, and basic IPC). It is **not** a certified safety RTOS; it is a **concise, readable** codebase you can walk through on a whiteboard: PendSV-based preemption, eight priority levels with round-robin within a level, mutex priority inheritance (demonstrated in `examples/mutex_demo`), and a small set of primitives (semaphores, message queues, software timers, heap).
+
+**Why build it:** To show that you understand **Cortex-M exception model** (MSP vs PSP, SVC first dispatch, PendSV for deferred context switch), **scheduler invariants**, and **common embedded pitfalls** (stack alignment, ISR-safe rules, volatile/shared data, stack canaries).
+
+## Target platform
+
+| Item | Detail |
+|------|--------|
+| **MCU class** | STM32F407-equivalent (Cortex-M4F, 168 MHz target on hardware) |
+| **Link map** | 1 MiB Flash @ `0x08000000`, 128 KiB SRAM @ `0x20000000` (main SRAM only; CCM not modeled) |
+| **Simulation** | QEMU `-M netduino2` (STM32F2-class; **approximate** — use [Renode](https://renode.io/) for closer STM32 models) |
+| **Toolchain** | `arm-none-eabi-gcc`, newlib nano, GNU Make |
+
 ## Features
 
 - **Tasks**: TCB with stack canaries, eight scheduler priority buckets (maps logical `0–255` priorities), idle task.
@@ -11,6 +28,18 @@ Interview-oriented preemptive RTOS for **ARM Cortex-M4** (STM32F407-class), with
 - **Heap**: First-fit allocator over a static pool (**no** libc heap use inside ISRs).
 - **Timers**: Sorted (by expiry) software timers invoked from the SysTick path.
 - **Time**: `task_delay()`, global tick counter, wake sorted blocked tasks in SysTick.
+
+## Repository layout
+
+- `include/` — Public headers (`rtos.h`, `rtos_config.h`, `rtos_types.h`).
+- `src/core/` — Scheduler, tasks, PendSV assembly.
+- `src/platform/` — Clock/SysTick hooks, startup glue.
+- `platform/stm32f4/` — Linker script and startup vector table.
+- `examples/` — `blinky`, `mutex_demo` (PI narrative), `stress_test` (10 tasks + mutex contention).
+- `tests/` — Standalone firmware tests (`APP=` selector in the Makefile).
+- `docs/` — Architecture notes, API overview, diagram checklist for interviews.
+
+Start with **`docs/architecture.md`** for memory map and scheduler design, then **`src/core/context_switch.s`** for the exception path.
 
 ## Performance metrics
 
@@ -52,17 +81,6 @@ When corruption is detected, execution stops in **`rtos_stack_check_all()`** wit
 - **`g_rtos_stack_overflow_canary`** — value read at stack base (should differ from `RTOS_STACK_CANARY`).
 
 Set a breakpoint on that loop or watch those globals in GDB.
-
-## Repository layout
-
-- `include/` — Public headers (`rtos.h`, `rtos_config.h`, `rtos_types.h`).
-- `src/core/` — Scheduler, tasks, PendSV assembly.
-- `src/platform/` — Clock/SysTick hooks, startup glue.
-- `platform/stm32f4/` — Linker script and startup vector table.
-- `examples/` — `blinky`, `mutex_demo`, `stress_test`.
-- `tests/` — Standalone firmware tests (`APP=` selector in the Makefile).
-
-Cursor rule files live under **`.cursor/rules/`** (there is intentionally no root `.cursorrules` file).
 
 ## Why not vs FreeRTOS
 
