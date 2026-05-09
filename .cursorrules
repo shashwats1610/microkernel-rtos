@@ -1,0 +1,44 @@
+# Cursor Rules — Secure Dual-Bank Bootloader
+
+## Project context
+This is a portfolio-grade ARM Cortex-M4 (STM32F407) secure bootloader with
+ECDSA-P256 firmware verification, dual-bank A/B partitions, automatic
+rollback, IWDG watchdog, and UART-based OTA updates. It is intended to
+compile cleanly with `arm-none-eabi-gcc` and run in QEMU
+(`-machine netduino2`) or Renode (`stm32f4_discovery`).
+
+## Coding rules
+- C11, freestanding, no libc allocation. Avoid `malloc`/`free`.
+- All code must compile with `-Wall -Wextra -Werror`.
+- Bootloader code must fit within 64 KB at 0x08000000-0x0800FFFF.
+- Never modify the active firmware in place; write new firmware to the
+  inactive slot only.
+- All flash writes must use the `flash_driver` HAL, never direct memory
+  writes (except inside the `QEMU_FLASH_SIM` short-circuit).
+- All long-running loops (flash erase, OTA receive, ECDSA verify) must
+  call `iwdg_kick()` periodically.
+- Power-loss safety: write-then-readback-verify; the CRC field of any
+  persisted record is written last so torn writes are detectable.
+
+## Memory map (do not change without updating common/memory_map.h asserts)
+- Bootloader:  0x08000000  (64 KB)
+- BootConfig:  0x08010000  (4 KB logical, sector 4 on real F407)
+- Slot A:      0x08011000  (460 KB)  -> app entry at 0x08011200
+- Slot B:      0x08084000  (460 KB)  -> app entry at 0x08084200
+- SharedBootBlock at 0x2001FFF0 in SRAM (16 B, NOLOAD)
+
+## Crypto
+- micro-ecc (SECP256R1) is the on-device verifier.
+- Signature format: raw r||s, 64 bytes, big-endian, fixed-length.
+- SHA-256 is computed over [header_with_zeroed_signature || payload].
+- Public key is embedded as `public_key_xy[64]` (X || Y).
+
+## Build conventions
+- `make qemu`: Cortex-M3 / soft-float / `QEMU_FLASH_SIM=1`.
+- `make hw`:   Cortex-M4 / hard-float / FPU / real FLASH register code.
+
+## Style
+- Doxygen-style comments on public functions in headers.
+- No code comments that just narrate what the next line does. Comments
+  explain why, not what.
+- Use `static` for any function not exported in a header.

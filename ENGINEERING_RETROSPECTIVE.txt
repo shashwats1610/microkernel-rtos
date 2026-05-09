@@ -1,0 +1,1592 @@
+================================================================================
+ SECURE DUAL-BANK BOOTLOADER WITH OTA - ENGINEERING RETROSPECTIVE
+================================================================================
+
+A chronological catalogue of every meaningful problem encountered while
+building this project, the diagnostic path that led to the root cause, the
+fix that was applied, and why the fix works. Written specifically for
+technical interview preparation: each section is structured as
+
+    SYMPTOM -> ROOT CAUSE -> FIX -> WHY THE FIX IS CORRECT
+
+so the same talking-points can be re-used in a system-design or debugging-
+focused conversation. Issues are grouped by the layer of the system where
+they live, not strict chronology, but ordered roughly the way they were
+discovered while implementing the spec.
+
+There are 23 entries below. The big ones (interview gold) are #14 (QEMU's
+flash is ROM and how a SRAM-backed shadow rescues testability) and #4 (the
+512-byte header padding that prevents a real-hardware Cortex-M4 fault).
+
+================================================================================
+ TABLE OF CONTENTS
+================================================================================
+
+   1. Toolchain not on Windows PATH
+   2. Makefile uses Unix shell commands on Windows
+   3. Cross-platform sub-targets (preflight, renode)
+   4. Cortex-M4 VTOR alignment - the 512-byte firmware header
+   5. STM32F407 SRAM size: 192 KB vs 128 KB confusion
+   6. QEMU machine choice - olimex-stm32-h405 unavailable
+   7. mbedTLS would blow the 64 KB bootloader budget
+   8. ECDSA signature byte order - r||s vs DER
+   9. ECDSA "what-do-we-hash-over" - the canonical signed region
+  10. Boot config torn-write safety - CRC field programmed last
+  11. STM32F4 sector 4 erase granularity (64 KB)
+  12. SharedBootBlock placement and zeroing avoidance
+  13. Boot flow correctness fixes (4 sub-issues)
+  14. QEMU's flash region is ROM (the largest issue)
+  15. Compiler optimised the flash readback verify away
+  16. crypto.c streamed via direct pointer over the shadow boundary
+  17. OTA transport on Windows - serial port pain, TCP fix
+  18. OTA push initially fired against running app, not bootloader
+  19. socket.recv() returning partial bytes (TCP framing)
+  20. embed_pubkey.py and textwrap.dedent indentation
+  21. Missing #include <stddef.h> for offsetof
+  22. Iteration cap defense-in-depth in pick_slot_to_boot
+  23. HW build still pays the SRAM-shadow tax in the linker
+
+================================================================================
+ 1. TOOLCHAIN NOT ON WINDOWS PATH
+================================================================================
+
+WHEN
+    Very first action after writing the Makefile: `make preflight` failed.
+
+SYMPTOM
+    `arm-none-eabi-gcc : The term 'arm-none-eabi-gcc' is not recognized
+    as the name of a cmdlet, function, script file, or operable
+    program.` Same for `qemu-system-arm` and `make` itself.
+
+ROOT CAUSE
+    The development environment was a fresh Windows install. None of the
+    embedded toolchain components were present. There is no equivalent
+    of `apt install gcc-arm-none-eabi qemu-system-arm make` in stock
+    Windows.
+
+FIX
+    Used `winget` (the Windows 10/11 package manager) to install:
+      winget install --id Arm.GnuArmEmbeddedToolchain
+      winget install --id qemu.qemu
+      winget install --id GnuWin32.Make
+    Then refreshed the PATH for the current PowerShell session
+    (winget does not always update the in-process environment).
+
+WHY THIS WORKS
+    These three are the canonical packages: ARM publishes the official
+    cross-toolchain, the QEMU project ships Windows binaries, and
+    GnuWin32's Make is a faithful port. There is no licensing or
+    architecture mismatch.
+
+INTERVIEWER ANGLE
+    Demonstrates that "works on my Linux box" is not a sufficient
+    answer for a portfolio piece. Shows you actually thought about
+    distribution and reproducibility.
+
+================================================================================
+ 2. MAKEFILE USED UNIX SHELL COMMANDS ON WINDOWS
+================================================================================
+
+WHEN
+    Immediately after the toolchain was installed, on the second
+    `make all` attempt.
+
+SYMPTOM
+    `mkdir -p build/bootloader` and `rm -rf build` both failed.
+    `mkdir` on Windows does not understand `-p`; `rm` does not exist
+    at all. GnuWin32 Make on Windows defaults to using `cmd.exe` as
+    its `SHELL`, not `bash`.
+
+ROOT CAUSE
+    The Makefile was written with implicit dependence on a POSIX
+    shell. Even on a Linux host the same Makefile happens to work,
+    which masks the portability bug.
+
+FIX
+    Replaced the helper variables:
+
+        MKDIR_P := python -c "import sys, pathlib; \
+                     [pathlib.Path(p).mkdir(parents=True, exist_ok=True) \
+                      for p in sys.argv[1:]]"
+        RM_RF   := python -c "import sys, shutil; \
+                     [shutil.rmtree(p, ignore_errors=True) \
+                      for p in sys.argv[1:]]"
+        RM_F    := python -c "import sys, pathlib; \
+                     [pathlib.Path(p).unlink(missing_ok=True) \
+                      for p in sys.argv[1:]]"
+
+    Then used `$(MKDIR_P) build/bootloader` etc. throughout.
+
+WHY THIS WORKS
+    Python is a hard requirement of the project anyway (key-gen,
+    image-creation, signing, OTA server, flash-layout). Calling out
+    to it for trivially portable filesystem ops costs ~50 ms per
+    invocation but eliminates an entire class of platform bugs.
+    Python's `pathlib.Path.mkdir(parents=True, exist_ok=True)` and
+    `shutil.rmtree(..., ignore_errors=True)` are the literal
+    semantics of `mkdir -p` and `rm -rf`.
+
+INTERVIEWER ANGLE
+    Pragmatic engineering judgment: when the dependency you need is
+    already present, lean on it instead of shelling out to whatever
+    POSIX-flavoured tool happens to be installed.
+
+================================================================================
+ 3. CROSS-PLATFORM SUB-TARGETS (preflight, renode)
+================================================================================
+
+WHEN
+    During Makefile authoring, after issue #2 was fixed.
+
+SYMPTOM
+    `make preflight` was supposed to print a summary of toolchain
+    versions. The first version used `which arm-none-eabi-gcc` which
+    is `where.exe` on Windows but `which` on POSIX. The `make renode`
+    target wrote a .resc script with a heredoc that cmd.exe couldn't
+    parse.
+
+ROOT CAUSE
+    Same family of bug as #2 - shell command portability.
+
+FIX
+    Replaced both with `python -c` one-liners. For `preflight` the
+    one-liner imports `shutil` and uses `shutil.which()` to resolve
+    each tool, with a clean print format. For `renode` the script
+    uses `open(...).write(...)` to emit the .resc file from a
+    triple-quoted f-string, instead of relying on shell heredocs.
+
+WHY THIS WORKS
+    `shutil.which` is the cross-platform equivalent of POSIX `which`
+    and Windows `where`. `open().write()` is the universal way to
+    emit a multi-line text file. Neither depends on the host shell.
+
+INTERVIEWER ANGLE
+    Same theme as #2 but in a different shape. Shows you generalise
+    the lesson rather than hot-fixing each occurrence.
+
+================================================================================
+ 4. CORTEX-M4 VTOR ALIGNMENT - THE 512-BYTE FIRMWARE HEADER
+================================================================================
+
+WHEN
+    During the design pass before any code was written, when sketching
+    common/firmware_format.h.
+
+SYMPTOM
+    The original spec described a "compact" firmware header (~80
+    bytes). With a slot at 0x08011000 and a header of 80 bytes, the
+    application's vector table would land at 0x08011050 - which is
+    not a multiple of 512.
+
+WHY THAT MATTERS
+    The Cortex-M4 (and M3) Vector Table Offset Register (`SCB->VTOR`,
+    address 0xE000ED08) accepts only 32 word-aligned values where the
+    low TBLOFF[8:0] bits must satisfy a NUMBER_OF_VECTORS-rounded-up
+    alignment. The Architecture Reference Manual is explicit:
+        "The vector table must be naturally aligned to a power of 2
+         which is greater than or equal to the number of exceptions
+         supported (rounded up to a power of 2), times 4."
+    For 96 exception entries (STM32F4 typical) that rounds up to 256
+    entries -> 1024-byte alignment. The lazier, universally-safe
+    rule that toolchains and reference designs use is **512-byte
+    alignment** (which covers any standard STM32F4 ISR table size).
+    Writing a non-aligned value to VTOR on Cortex-M4 produces UNDEFINED
+    behaviour at the next exception entry; on real silicon this
+    typically manifests as a HardFault on the very first SysTick or
+    UART RX interrupt after the bootloader jumps. On QEMU it might
+    "appear" to work because QEMU is more forgiving of VTOR mis-alignment.
+
+ROOT CAUSE
+    The spec had not accounted for the Cortex-M alignment rule, and
+    QEMU's permissiveness would have hidden the bug until it shipped
+    on real hardware.
+
+FIX
+    Padded `FirmwareHeader_t` to a fixed 512 bytes. The header now
+    consists of: magic(4) + version(4) + image_size(4) + timestamp(4)
+    + crc32(4) + signature(64) + reserved padding to 512 bytes total.
+    Combined with slot bases at 0x08011000 and 0x08084000 (both
+    multiples of 0x1000), this guarantees the application vector table
+    (immediately after the header) lands at a 512-byte-aligned
+    address: 0x08011200 and 0x08084200 respectively.
+
+    Reinforced with a compile-time guarantee in common/memory_map.h:
+
+        _Static_assert(((SLOT_A_ADDR + FIRMWARE_HEADER_SIZE) & 0x1FF) == 0,
+                       "App VT must be 512-byte aligned (Cortex-M VTOR)");
+
+    And a runtime backstop in `bootloader_jump_to_application()` that
+    checks the same condition and halts with a fatal log if the
+    config-driven slot address ever produces an unaligned VT.
+
+WHY THIS WORKS
+    A 512-aligned slot address plus a 512-aligned header size
+    arithmetically guarantees a 512-aligned VT. The static assert
+    catches it at link time even if someone later edits the layout;
+    the runtime check catches it if the live BootConfig is corrupted
+    such that we ever derive a slot address from a non-aligned source.
+
+INTERVIEWER ANGLE
+    Two-part talking point: (1) QEMU's faithfulness vs silicon; never
+    trust simulator-only validation for hardware-specific guarantees,
+    and (2) the header padding is not "wasted space" - it is the
+    enforcement mechanism for a CPU-architecture invariant. Mention
+    that `_Static_assert` is the cheapest, earliest-firing line of
+    defence - failures at link time cost nothing.
+
+================================================================================
+ 5. STM32F407 SRAM SIZE - 192 KB MYTH VS 128 KB REALITY
+================================================================================
+
+WHEN
+    During common/memory_map.h authoring; caught by a `_Static_assert`
+    on the SharedBootBlock placement.
+
+SYMPTOM
+    The first version had:
+
+        #define SRAM_BASE_ADDR    0x20000000UL
+        #define SRAM_TOTAL_SIZE   (192UL * 1024UL)
+        #define SRAM_END_ADDR     (SRAM_BASE_ADDR + SRAM_TOTAL_SIZE)
+        ...
+        _Static_assert(SHARED_BLOCK_ADDR + SHARED_BLOCK_SIZE == SRAM_END_ADDR,
+                       "SharedBootBlock must end at the top of SRAM");
+
+    With SHARED_BLOCK_ADDR == 0x2001FFF0 and SHARED_BLOCK_SIZE == 16,
+    that arithmetic only works if SRAM_TOTAL_SIZE == 128 KB
+    (0x2001FFF0 + 0x10 = 0x20020000 = 0x20000000 + 0x20000 = +128 KB).
+    The static assert failed at compile.
+
+ROOT CAUSE
+    "STM32F407 has 192 KB of RAM" is technically correct from the
+    datasheet headline, but misleading. The 192 KB is split:
+        - 128 KB contiguous SRAM (SRAM1 + SRAM2) at 0x20000000
+        - 64 KB CCM (Core-Coupled Memory) at 0x10000000, NOT contiguous
+          with SRAM and not accessible to the DMA engine.
+    The SharedBootBlock must live at the top of contiguous SRAM, which
+    is 0x20020000 - 16 = 0x2001FFF0. Putting it 64 KB higher would
+    place it in CCM, which is not what we want and would break DMA
+    handoffs (none of which we use here, but the design must be
+    correct for real-hardware extension).
+
+FIX
+    Corrected `SRAM_TOTAL_SIZE` to 128 KB throughout:
+        - common/memory_map.h
+        - bootloader/linker_bootloader.ld
+        - application/linker_app.ld
+        - docs/architecture.md
+        - README.md
+
+    Added a comment block in memory_map.h calling out the CCM split
+    explicitly, so future readers don't repeat the mistake.
+
+WHY THIS WORKS
+    The static assert now passes because the arithmetic balances.
+    The linker scripts no longer claim 192 KB of contiguous SRAM that
+    the silicon doesn't provide, so a future stack-overflow into the
+    "phantom" SRAM region cannot occur silently.
+
+INTERVIEWER ANGLE
+    Good "I caught it before it shipped" story. The compile-time
+    assert is the hero - without it the bug would have slipped into
+    the design docs and probably hardware, where the symptom would
+    be "DMA randomly corrupts data" or "SharedBootBlock seems empty
+    after reset" with a much harder bisect.
+
+================================================================================
+ 6. QEMU MACHINE CHOICE - OLIMEX-STM32-H405 UNAVAILABLE
+================================================================================
+
+WHEN
+    First attempt to launch QEMU after `make all` succeeded.
+
+SYMPTOM
+    `qemu-system-arm: -machine olimex-stm32-h405: machine type not
+    supported`. Tried with multiple QEMU versions including the
+    latest stable; none had the olimex-h405 board.
+
+ROOT CAUSE
+    The Olimex H405 board model exists in some out-of-tree QEMU forks
+    but not in mainline QEMU (verified against QEMU 11.0.0 source).
+    For STM32F2/F4-class targets, mainline QEMU ships
+    `netduino2` (STM32F205, Cortex-M3) and `netduinoplus2` (STM32F405,
+    Cortex-M4F).
+
+FIX
+    Switched to `-machine netduino2` for the QEMU build.
+    (Tried netduinoplus2 too - it has FPU enabled by default but its
+    USART model has subtle differences that made the OTA loopback
+    less reliable; netduino2 + soft-float was the safer simulator.)
+
+    To preserve a path to F407 fidelity, added a Renode target to
+    the Makefile that emits a .resc script for the
+    `stm32f4_discovery` platform. Documented the trade-off in
+    README.md and docs/build_and_run.md.
+
+WHY THIS WORKS
+    netduino2 covers the relevant vector-table layout, USART
+    register interface, and 1 MB flash window we care about for
+    bootloader testing. The bits where netduino2 != STM32F407
+    (clock tree, DMA, SDIO) are not used by the bootloader. Renode
+    closes the remaining gap when full F4 fidelity is needed.
+
+INTERVIEWER ANGLE
+    Shows you can navigate "the simulator I assumed was available
+    isn't" without panicking. Also a good lead-in to the philosophical
+    point that **simulators are tools, not test environments** - any
+    non-trivial firmware project needs at least two of {QEMU, Renode,
+    real hardware} to cross-check.
+
+================================================================================
+ 7. MBEDTLS WOULD BLOW THE 64 KB BOOTLOADER BUDGET
+================================================================================
+
+WHEN
+    During crypto-library selection, before any crypto code was
+    written.
+
+SYMPTOM (PROJECTED)
+    A typical cut-down mbedTLS build (only ECDSA-P256 + SHA-256, no
+    cipher suites, no TLS, no PK parsing) is ~30-40 KB of code.
+    Adding lwIP for the production HTTP transport story would be
+    another 40-50 KB. Bootloader partition is 64 KB. The math does
+    not work.
+
+ROOT CAUSE
+    mbedTLS is a TLS library first, a crypto primitive library
+    second. It carries hundreds of KB of feature surface that is
+    irrelevant to verifying a 64-byte ECDSA signature, and the
+    feature-trim macros only get you part of the way down.
+
+FIX
+    Selected micro-ecc as the ECDSA backend (~6 KB, secp256r1-only,
+    no big-number library exposed) and a standalone public-domain
+    SHA-256 (~2 KB) instead. Vendored both in `third_party/`:
+
+        third_party/micro-ecc/uECC.{c,h}
+        third_party/micro-ecc/uECC_vli.h
+        bootloader/src/sha256.c   (Brad Conte port, public domain)
+        bootloader/include/sha256.h
+
+    Configured micro-ecc in compile flags to exclude every curve we
+    don't use:
+
+        -DuECC_SUPPORTS_secp160r1=0
+        -DuECC_SUPPORTS_secp192r1=0
+        -DuECC_SUPPORTS_secp224r1=0
+        -DuECC_SUPPORTS_secp256r1=1
+        -DuECC_SUPPORTS_secp256k1=0
+        -DuECC_OPTIMIZATION_LEVEL=2
+
+    Documented mbedTLS as the production-alternative path
+    (in security_analysis.md), specifically because mbedTLS supports
+    hardware acceleration via STM32's CryptoLib on F4.
+
+WHY THIS WORKS
+    micro-ecc is purpose-built for tiny embedded verification with
+    fixed curves; uECC_verify takes raw r||s as a 64-byte buffer
+    which is exactly what we put in the firmware header. There's no
+    DER parsing, no ASN.1 surface, and no malloc. The whole crypto
+    pipeline (CRC + SHA + ECDSA) measures at <13 KB linked, leaving
+    >50 KB of headroom in the 64 KB partition.
+
+INTERVIEWER ANGLE
+    Right answer to "why didn't you use mbedTLS?" is not "it's slow"
+    or "it's complicated" but **"it does the wrong thing for the
+    constraint"**. mbedTLS is a great library if you also need TLS
+    record-layer; it's the wrong tool for offline image verification
+    on a 64 KB target. Show your sizing math.
+
+================================================================================
+ 8. ECDSA SIGNATURE BYTE ORDER - r||s vs DER
+================================================================================
+
+WHEN
+    During tools/sign_firmware.py implementation.
+
+SYMPTOM (POTENTIAL)
+    The Python `ecdsa` library by default emits DER-encoded
+    signatures (variable-length, with ASN.1 wrappers). micro-ecc's
+    `uECC_verify` expects raw `r||s`, fixed 64 bytes (32 bytes r
+    big-endian, then 32 bytes s big-endian). Feeding DER bytes into
+    `uECC_verify` returns 0 (failure) every time and does so
+    silently - "your signature is wrong" with no clue as to why.
+
+ROOT CAUSE
+    Two equally legitimate ECDSA signature formats exist; nothing
+    enforces which one a given verifier wants. The Python library
+    default (DER) is the wrong default for a micro-ecc target.
+
+FIX
+    In tools/sign_firmware.py:
+
+        sig_der = sk.sign_digest(hash_bytes)            # default DER
+        # convert to raw r||s
+        sig_raw = util.sigdecode_string(sig_der, sk.curve.order)
+        # then re-pack as two 32-byte big-endian halves
+
+    More directly, use the `sigencode_string` mode of
+    python-ecdsa to skip the DER step entirely:
+
+        sig_raw = sk.sign_digest(hash_bytes,
+                                  sigencode=sigencode_string)
+        assert len(sig_raw) == 64   # 32 + 32, big-endian
+
+    The 64-byte r||s is then written directly into the
+    FirmwareHeader_t.signature field.
+
+    Locked in with a Python self-consistency test
+    (tests/test_signature_python.py) that round-trips: generate key
+    -> sign image -> reload public key -> verify with raw r||s ->
+    PASS. Plus mutation tests: flip a payload byte, verify, expect
+    REJECT.
+
+WHY THIS WORKS
+    Both signer and verifier now use the same wire format,
+    documented in docs/update_protocol.md and asserted at compile
+    time (FirmwareHeader_t.signature is uint8_t[64]). Mutation
+    tests guard against a future regression where someone adds DER
+    handling on either side.
+
+INTERVIEWER ANGLE
+    "Crypto API mismatches always fail closed and silently" is a
+    good general lesson. Show you wrote the round-trip test before
+    declaring victory.
+
+================================================================================
+ 9. ECDSA - WHAT EXACTLY DO WE HASH OVER?
+================================================================================
+
+WHEN
+    During crypto.c implementation, when writing
+    `hash_signed_region()`.
+
+SYMPTOM (POTENTIAL)
+    The signature lives inside the header. So if we sign
+    `hash(header || payload)` and then write the signature into the
+    header, the next verifier will compute a different hash because
+    the header has now been mutated. Whatever scheme we pick, signer
+    and verifier must agree on the **canonical** signed-region
+    layout.
+
+ROOT CAUSE
+    A standard issue when the signature is stored in the same blob
+    it covers. There's no single right answer - many designs solve
+    it differently (separate signature trailer, DER container, etc.).
+
+FIX
+    Defined the canonical signed region as
+
+        [ header with signature field replaced by 64 zero bytes
+          || payload ]
+
+    Both signer and verifier construct exactly this byte stream and
+    hash it. The key is that the signature field is always 64 zero
+    bytes during the hash computation, regardless of whether we are
+    signing (signature not yet known) or verifying (signature
+    already known but ignored for the hash).
+
+    Implemented via `hash_signed_region()` in bootloader/src/crypto.c
+    and the matching helper in tools/sign_firmware.py and
+    tools/firmware_image.py:
+
+        hash starts; feed bytes BEFORE signature field;
+        feed 64 zero bytes for the signature field;
+        feed bytes AFTER signature field through end of header;
+        feed the payload (chunked).
+
+    The signature offset is asserted at compile time:
+
+        _Static_assert(offsetof(FirmwareHeader_t, signature) == 20U,
+                       "Signature field offset assumption broken");
+
+WHY THIS WORKS
+    The verifier sees the same byte stream the signer signed. If a
+    bit of the header (other than the signature) flips, the hash
+    changes and verification fails. If the signature itself is
+    flipped, the hash is unaffected but uECC_verify rejects the
+    altered signature.
+
+INTERVIEWER ANGLE
+    Fundamental design question for any "in-band" signed-image
+    format. This is the same problem PE Authenticode and DEB-sig
+    solve in different ways.
+
+================================================================================
+ 10. BOOT CONFIG TORN-WRITE SAFETY - CRC FIELD PROGRAMMED LAST
+================================================================================
+
+WHEN
+    During boot_config.c implementation, before any test ran.
+
+SYMPTOM (PROJECTED)
+    If power is lost partway through writing a new BootConfig
+    record, the on-flash record is in a half-erased / half-written
+    state. On the next boot we'd read garbage interpreted as boot
+    state and likely brick the device.
+
+ROOT CAUSE
+    NOR flash is byte/word-programmable but only sector-erasable.
+    A power loss can interrupt a multi-word program operation,
+    leaving some words at their new value, others still 0xFF.
+
+FIX
+    Three-step write protocol implemented in `boot_config_save`:
+
+        Step 1: erase the config region (sector 4 on real F4).
+                After this the whole region reads as 0xFF.
+        Step 2: program every byte of the new BootConfig EXCEPT
+                the crc32 field.
+        Step 3: program the crc32 field LAST, as a single 32-bit
+                word write.
+
+    On the read path, `boot_config_load` calls
+    `boot_config_validate` which checks both
+        (a) magic == BOOT_CONFIG_MAGIC, AND
+        (b) recomputed CRC32 over [0, CRC_OFFSET) ==
+            stored crc32 field.
+
+WHY THIS WORKS
+    If power is lost between step 1 and step 2: region is all 0xFF,
+    magic check fails -> use defaults.
+    If power is lost between step 2 and step 3: data is on flash but
+    crc32 still reads 0xFFFFFFFF from the un-programmed word. CRC
+    recomputation will not equal 0xFFFFFFFF (vanishingly unlikely
+    even adversarially), so validation fails -> use defaults.
+    If power is lost during step 3: a single 32-bit flash word write
+    is **atomic** on STM32F4 (the FLASH controller programs by 8/16/
+    32/64-bit units without an intermediate-visible state). The
+    word is either fully old (still 0xFFFFFFFF) or fully new. Either
+    way, a CRC mismatch with the rest of the record means we fall
+    back to defaults safely.
+
+    The fall-back-to-defaults path is itself idempotent: it just
+    means we lose the most recent unsaved increment of
+    `boot_attempts` or `last_good_boot`, never the firmware itself.
+
+    Defensive copy in `boot_config_save` re-stamps the CRC inside
+    the function so callers cannot accidentally save a record whose
+    CRC doesn't match its body.
+
+INTERVIEWER ANGLE
+    Classic atomic-update via single-word commit. The same idea
+    underlies SQLite's journal commit, ZFS's uberblock, and most
+    flash file-system superblock update strategies. Mention that
+    the strategy depends on the **single-word write being atomic**;
+    on flash technologies where writes are page-granular this would
+    need a different approach (typically: write whole page to a
+    spare, then erase the old).
+
+================================================================================
+ 11. STM32F4 SECTOR 4 ERASE GRANULARITY (64 KB)
+================================================================================
+
+WHEN
+    During flash_driver.c implementation, when writing the sector
+    table.
+
+SYMPTOM (PROJECTED)
+    Wanting to dedicate "4 KB" to the BootConfig at 0x08010000, but
+    the STM32F407's sector layout puts sector 4 (16-128 KB sectors
+    in this part) starting at exactly that address - and sector 4
+    is 64 KB in size. There is no way to erase only the first 4 KB.
+
+ROOT CAUSE
+    NOR flash sector boundaries are determined by the silicon. The
+    STM32F407 has the F4 family's "non-uniform sector layout":
+    sectors 0-3 are 16 KB each, sector 4 is 64 KB, sectors 5-11 are
+    128 KB each. The 4 KB boot-config sub-region we want is a
+    logical sub-region inside sector 4, not its own erase unit.
+
+FIX
+    Two acceptable strategies, both documented in
+    docs/architecture.md:
+
+        Option 1 (current): treat the whole sector 4 as the
+        config region. Waste 60 KB of physical flash, but keep
+        the spec-clean address layout. The code only writes the
+        first 4 KB; the remaining 60 KB stays at 0xFF.
+
+        Option 2 (recommended for production): ping-pong between
+        sectors 4 and 5 (128 KB total cost), with an "active"
+        sector marker that lets us write the new record to the
+        spare and then erase the old. This gives true atomic
+        update semantics with no read-modify-erase risk window.
+
+    The current code uses Option 1. The torn-write CRC-protected
+    recovery (issue #10) makes Option 1 safe; Option 2 would be
+    needed only if the wear-leveling cost of erasing-and-rewriting
+    a full 64 KB sector on every boot config update were
+    unacceptable. For our use case (config is updated rarely - a
+    few times per boot) Option 1 is fine.
+
+WHY THIS WORKS
+    The CRC-protected save in #10 means torn writes always
+    fall-back-to-defaults rather than corrupt the device. The wear
+    cost is bounded by the number of slot switches and OTA events,
+    both of which are infrequent operationally. Sector 4's
+    100k-cycle endurance gives ~5 minutes of OTA-per-second activity
+    before wear-out, which is far beyond any realistic deployment.
+
+INTERVIEWER ANGLE
+    Shows you understand non-uniform NOR sector layouts and have
+    thought about wear-leveling, even if you didn't implement
+    Option 2. The phrase "we're choosing simplicity over wear-
+    leveling because the access pattern is rare; here's the
+    trade-off" is the answer interviewers want.
+
+================================================================================
+ 12. SHAREDBOOTBLOCK PLACEMENT AND ZEROING AVOIDANCE
+================================================================================
+
+WHEN
+    During linker script and startup.s authoring.
+
+SYMPTOM (PROJECTED)
+    The bootloader and the application both run on the same SRAM.
+    The bootloader needs to leave a small message for the
+    application ("here's your active slot") and the application
+    needs to leave a small message for the bootloader ("I confirmed
+    boot" or "please OTA-swap on reboot"). If we just declare a
+    plain `static SharedBootBlock_t` somewhere, the C startup
+    (.bss zero) will wipe it on every boot, defeating the purpose.
+
+ROOT CAUSE
+    Standard startup code zeroes everything in the .bss section
+    between the linker symbols `_sbss` and `_ebss`. To preserve a
+    region across reset, it must live OUTSIDE that range.
+
+FIX
+    Defined a dedicated linker section `.shared_boot_block` placed
+    at exactly 0x2001FFF0 with the NOLOAD attribute, in BOTH the
+    bootloader and the application linker scripts:
+
+        .shared_boot_block 0x2001FFF0 (NOLOAD) :
+        {
+            KEEP(*(.shared_boot_block))
+        }
+
+    The C definition uses an attribute to land in that section:
+
+        __attribute__((section(".shared_boot_block")))
+        SharedBootBlock_t SHARED_BOOT_BLOCK;
+
+    The startup files (bootloader/startup.s and
+    application/startup_app.s) explicitly do NOT include this
+    section in the .bss zero loop because:
+        - .bss has its own _sbss/_ebss bracket
+        - .shared_boot_block is in a separate section
+        - the loop iterates [_sbss, _ebss), not the whole RAM
+
+    A magic cookie field in the struct distinguishes
+    "valid handoff state" from "uninitialised RAM after a true cold
+    boot". The bootloader checks `magic == SHARED_BLOCK_MAGIC`
+    before trusting any other field.
+
+WHY THIS WORKS
+    NOLOAD tells the linker "reserve address space for this section
+    but do not load any bytes from it into the binary, and don't
+    place it in any LOAD segment". The startup zeroing loop never
+    sees these addresses, so RAM contents survive across an NVIC
+    soft reset (which does not clear SRAM on the STM32F4).
+
+    The magic-cookie check guards against a true cold reset (after
+    full power-cycle), where SRAM contents are unspecified.
+    Without the check we might interpret random bits as a "previous
+    boot confirmed itself" signal.
+
+INTERVIEWER ANGLE
+    The pattern (NOLOAD section + magic cookie + post-reset
+    handoff) is reused later for the QEMU flash shadow (see #14).
+    It's a generally useful pattern for any "persistent across
+    soft reset, gone after cold reset" data.
+
+================================================================================
+ 13. BOOT FLOW CORRECTNESS FIXES (FOUR SUB-ISSUES)
+================================================================================
+
+WHEN
+    After the first draft of main.c was reviewed against the
+    state-machine diagram. Four edge cases needed explicit handling.
+
+The issues and fixes:
+
+    13a. POST-OTA SWAP MUST RE-VERIFY, AND REVERT ON FAILURE
+    -------------------------------------------------------
+    Symptom (potential): If we set
+    `cfg->active_slot = inactive_slot` and save, but a transient
+    flash read failure (or cosmic ray) causes the new slot to
+    suddenly fail verify, we'd be stranded on a confirmed-but-
+    invalid active slot.
+
+    Fix: In `process_ota_pending_swap()`, after the swap-and-save,
+    re-verify the new active slot. On failure, swap back to the
+    old active and save again.
+
+    Why it works: Both the original verify (before the swap) AND
+    the post-swap verify must succeed. The window between them is
+    small (hundreds of microseconds) but is exactly where a
+    transient read fault could surface.
+
+    13b. SLOT SWITCH ON ATTEMPTS > 3 MUST RESET ATTEMPTS BEFORE
+         RE-ENTERING VERIFY-ACTIVE
+    -----------------------------------------------------------
+    Symptom (potential): If `boot_attempts` reaches 4, we switch
+    active slot. If the new active slot is also bad, we'd see
+    `boot_attempts == 5` and switch again on the same boot,
+    ping-ponging between slots within a single boot cycle.
+
+    Fix: `cfg->boot_attempts = 0` is set BEFORE the `continue`
+    that re-enters the verify-active loop, AND the loop is bounded
+    by MAX_SWAP_RETRIES as a defense-in-depth backstop (#22).
+
+    Why it works: Resetting attempts means the first verify-active
+    iteration on the new active slot will not immediately re-trigger
+    the switch. The MAX_SWAP_RETRIES cap guarantees termination
+    even if there's a logic bug we missed.
+
+    13c. APPLICATION CONFIRMATION CHECK AFTER boot_config_load
+    ---------------------------------------------------------
+    Symptom (potential): If the previous boot's app called
+    `bootloader_confirm_boot()` (writing 1 to
+    SharedBootBlock.boot_confirmed) but we don't check it on the
+    next boot, `boot_attempts` will keep incrementing forever even
+    on healthy boots, eventually triggering an unwarranted
+    rollback.
+
+    Fix: `check_app_confirmation()` is called immediately after
+    `boot_config_load()`. If `boot_confirmed != 0`, reset
+    `boot_attempts` to 0 and stamp `last_good_boot`. ALWAYS clear
+    the SharedBootBlock flags after consuming them (so a stale 1
+    can't carry across cycles).
+
+    Why it works: The bootloader only trusts the confirmation
+    once - the next boot cycle starts from a clean slate. The
+    "always clear" rule eliminates an entire class of stale-state
+    bugs.
+
+    13d. UART RECOVERY MODE MUST BE A REACHABLE TERMINAL STATE
+    --------------------------------------------------------
+    Symptom (potential): The original draft had recovery mode as a
+    single-line "halt and spin" - no way to send a fresh image,
+    no way to verify from the host, no way to manually reboot.
+
+    Fix: Recovery mode runs a UART-driven menu (U/V/R commands)
+    that lets the operator (or a Python orchestrator) Upload a
+    signed image, Verify both slots, or Reboot. Implementation in
+    bootloader/src/recovery.c.
+
+    Why it works: Recovery is now a usable last-resort recovery
+    path, not a dead-end. The 'U' command reuses the OTA frame
+    receiver, so we have one OTA implementation that works from
+    both "app explicitly requested" and "bootloader fell into
+    recovery" entry points.
+
+ALL FOUR FIXES ARE IMPLEMENTED IN bootloader/src/main.c with comments
+referencing these failure modes. The diagram in docs/architecture.md
+and the README.md Mermaid block reflect them.
+
+INTERVIEWER ANGLE
+    Show that you can read your own state machine and find the
+    logic gaps before they become bugs. The four issues are all
+    "correctness in the presence of transient or adversarial
+    state", which is a different mental skill from "implement the
+    happy path".
+
+================================================================================
+ 14. QEMU's FLASH REGION IS ROM (THE LARGEST ISSUE)
+================================================================================
+
+This is the most substantial discovery in the project. It rolls together
+diagnostic work, root-cause analysis from QEMU source, and a non-trivial
+software design fix.
+
+WHEN
+    Late-stage testing. After the basic boot pipeline (verify ->
+    jump -> app banner -> tick) was confirmed working, the first
+    OTA push attempt failed in a confusing way.
+
+SYMPTOM PROGRESSION
+    (1) `make qemu` runs the bootloader and demo app; logs are clean.
+        But: every config save logs
+            "WARN: failed to persist config (post-pick)"
+        which I initially thought was a false alarm because the
+        next boot still works.
+    (2) Pushed an OTA image into recovery mode via test_recovery_ota.py.
+        All DATA frames ACKed.
+        END frame logged "OTA : verify failed; staying on active slot".
+        Confusing - the same image verifies fine when loaded as
+        Slot A on cold boot.
+    (3) Post-fix #15 (volatile readback) the symptom shifted to:
+            DATA frame at seq=2 -> NAK
+        i.e. flash_program_bytes was now correctly DETECTING that
+        the writes weren't persisting.
+
+ROOT CAUSE
+    Read QEMU 11.0.0's source for the netduino2 SoC
+    (hw/arm/stm32f205_soc.c) and found the smoking gun:
+
+        memory_region_init_rom(&s->flash, OBJECT(dev_soc),
+                               "STM32F205.flash",
+                               FLASH_SIZE, &error_fatal);
+
+    `memory_region_init_rom` makes the entire 0x08000000-based
+    flash window a TRUE read-only memory region at the QEMU bus
+    level. CPU loads return the image loaded via -kernel. CPU
+    stores are silently dropped at the bus - no fault, no write,
+    next read returns the original value.
+
+    This is true regardless of how the kernel image is loaded
+    (-kernel vs -device loader,addr=0x08000000,file=...). It is
+    not a bug in QEMU; the model is intentionally read-only because
+    QEMU does not implement the F2/F4 FLASH controller (which is
+    what allows writes on real silicon). It IS a bug in the
+    "test the bootloader on QEMU" plan, because the bootloader's
+    entire reason for existence is writing to flash.
+
+CONSTRAINTS ON THE FIX
+    - Cannot patch QEMU (cannot ship a forked toolchain).
+    - Cannot use a writable mock-flash external memory region;
+      the bootloader's code must run from the actual 0x08000000
+      address (instruction fetch goes through the bus, no
+      indirection possible from C).
+    - The shadow must survive an NVIC soft reset (so the post-OTA
+      "reboot, find ota_pending, swap-and-verify" path works
+      end-to-end on a single QEMU process), but can be re-init'd
+      from ROM on cold boot.
+    - Real-hardware build must NOT pay the cost.
+    - Must not require auditing every flash address dereference -
+      ideally route through one or two helpers.
+
+FIX (DESIGN)
+    A SRAM-backed shadow of the writable flash regions, gated by
+    the existing `-DQEMU_FLASH_SIM=1` compile flag. Specifically:
+
+    Layout:
+        typedef struct {
+            uint32_t magic;                    // 4 B cookie
+            uint8_t  config[4096];             // 4 KB boot config mirror
+            uint8_t  slot_a[32 * 1024];        // 32 KB Slot A head mirror
+            uint8_t  slot_b[32 * 1024];        // 32 KB Slot B head mirror
+        } qemu_flash_shadow_t;
+        // total: ~70 KB (includes alignment padding)
+
+    Placement (in bootloader/linker_bootloader.ld):
+        .flash_shadow 0x2000E000 (NOLOAD) :
+        {
+            KEEP(*(.flash_shadow))
+        }
+        // SRAM region was reduced from 128K-16 to 56K so the linker
+        // does not place .bss/heap/stack on top of the shadow.
+
+    Variable definition (in bootloader/src/flash_driver.c):
+        __attribute__((section(".flash_shadow"), used))
+        static qemu_flash_shadow_t g_qemu_flash_shadow;
+
+    Lazy init (in flash_init):
+        if (SHADOW.magic != QEMU_SHADOW_MAGIC) {
+            memcpy(SHADOW.config,  (const void *)BOOT_CONFIG_ADDR, 4096);
+            memcpy(SHADOW.slot_a,  (const void *)SLOT_A_ADDR,      32*1024);
+            memcpy(SHADOW.slot_b,  (const void *)SLOT_B_ADDR,      32*1024);
+            SHADOW.magic = QEMU_SHADOW_MAGIC;
+        }
+
+    Address translation (a small helper):
+        static uint8_t *shadow_byte_ptr(uint32_t addr) {
+            if (addr in [BOOT_CONFIG_ADDR,  +4 KB))   return shadow.config[...]
+            if (addr in [SLOT_A_ADDR, +32 KB))        return shadow.slot_a[...]
+            if (addr in [SLOT_B_ADDR, +32 KB))        return shadow.slot_b[...]
+            return NULL;
+        }
+
+    Routing:
+        flash_program_word/bytes/erase_range/erase_sector ->
+            write to shadow_byte_ptr(addr) only; return RANGE error
+            if address falls outside any shadow window (so we don't
+            silently drop writes outside the testable region).
+        flash_read ->
+            byte-by-byte, serve from shadow if shadow_byte_ptr is
+            non-NULL, otherwise from the raw ROM address (this
+            preserves correct behaviour for reads of the bootloader
+            text region itself).
+        flash_get_ptr (NEW) ->
+            returns a CPU-readable pointer to the shadow if address
+            is shadowed, else returns (void*)addr. Used by crypto.c
+            for header dereferences (see #16).
+
+    HW build: every line of the above is inside
+    `#if defined(QEMU_FLASH_SIM) && (QEMU_FLASH_SIM != 0)`, so the
+    HW build (BUILD=hw, no QEMU_FLASH_SIM) compiles out the entire
+    branch. flash_get_ptr in the HW path is a no-op cast.
+    The .flash_shadow linker section is empty in the HW build
+    (verified via objdump - the section is absent from the ELF).
+
+WHY THIS WORKS
+    - Lazy init from ROM means cold boot starts from the canonical
+      flash contents. Magic cookie distinguishes "fresh RAM" from
+      "soft-reset, shadow already populated".
+    - NOLOAD section is not zeroed by startup, so the shadow
+      survives a `bootloader_system_reset()` (NVIC AIRCR write).
+      This is exactly what the post-OTA reboot flow needs:
+      OTA writes to shadow -> reset -> bootloader runs again ->
+      shadow still there -> verify-and-swap succeeds.
+    - Routing reads through `flash_read`/`flash_get_ptr` makes the
+      shadow transparent to callers. crypto.c didn't need to
+      know about QEMU at all (only flash_driver.c does).
+    - Real hardware build is unaffected: the shadow is QEMU-only
+      conditional code; the section is absent from the HW ELF.
+
+IRREDUCIBLE LIMIT
+    There is one thing the shadow cannot fix: CPU instruction
+    fetch. After the bootloader does
+        bx app_reset_handler;
+    where app_reset_handler is at e.g. 0x08084200 in slot B, the
+    CPU pipeline starts fetching instructions from that physical
+    address - which is ROM, untouched by our shadow writes. So on
+    QEMU the post-OTA jump runs the ORIGINAL slot B contents
+    (which is 0xFF on a freshly-built flash.bin where slot B was
+    blank) and faults.
+
+    The recovery-OTA test asserts up to and including the
+    bootloader's final
+        "INFO: jumping to slot B (0x08084000 + 0x200)"
+    log line and stops there. That message proves every layer of
+    the bootloader's verify+swap+reboot-and-re-verify logic ran
+    correctly with shadow data. On Renode (which models writable
+    flash) or real silicon, the same code completes the jump and
+    runs the new firmware.
+
+DOCUMENTATION
+    The whole story is written up in docs/architecture.md under
+    "QEMU caveat — flash is ROM, with a SRAM-backed shadow", and
+    summarised in README.md under "QEMU caveat: flash is ROM, with
+    a SRAM shadow". The trade-off (shadow is 32 KB-per-slot,
+    sufficient for any realistic test image but not the full 460 KB
+    slot) is called out explicitly.
+
+INTERVIEWER ANGLE
+    This is the "biggest fish" of the project and the most
+    interview-relevant story. The arc is:
+       * a confusing symptom (failed config save, then verify
+         failure during OTA)
+       * a wrong first hypothesis (compiler-optimised away the
+         verify)
+       * fixing the wrong hypothesis exposes a deeper bug (writes
+         genuinely don't reach flash)
+       * reading QEMU source to confirm the model
+       * designing a non-invasive fix (NOLOAD shadow + helper)
+       * proving the fix's correctness boundary (CPU instruction
+         fetch is the irreducible limit; document it).
+    Expect to be asked: "could you have done it differently?",
+    "what's the cost on real hardware?", "how do you know your
+    test actually proves the bootloader works?".
+
+================================================================================
+ 15. COMPILER OPTIMISED AWAY THE FLASH WRITE READBACK VERIFY
+================================================================================
+
+WHEN
+    First step in diagnosing #14, before the QEMU-ROM root cause
+    was identified.
+
+SYMPTOM
+    The QEMU OTA test was reporting END verified == OK (the image
+    "appeared" to write fine) but the post-OTA bootloader couldn't
+    find the magic at slot B address. Reading from slot B returned
+    0xFF (untouched ROM). flash_program_bytes had been called and
+    returned FLASH_OK. Where did the bytes go?
+
+ROOT CAUSE
+    Original implementation:
+        flash_status_t flash_program_bytes(uint32_t addr,
+                                           const uint8_t *data,
+                                           uint32_t size) {
+            uint8_t *dst = (uint8_t *)addr;
+            for (uint32_t i = 0; i < size; ++i) {
+                dst[i] = data[i];
+                if (dst[i] != data[i]) return FLASH_ERR_VERIFY;
+                ...
+            }
+            return FLASH_OK;
+        }
+
+    `dst` is a non-volatile pointer. The compiler is allowed to
+    reason: "I just stored `data[i]` to `dst[i]`. Reading back
+    `dst[i]` will yield `data[i]`. Therefore
+    `dst[i] != data[i]` is always false. Dead branch."
+
+    With `-O2` (and even `-O1`), the readback-and-compare was
+    compiled out entirely. The function never returned
+    FLASH_ERR_VERIFY because the compiler proved the comparison
+    couldn't possibly differ. Combined with QEMU silently dropping
+    the write at the bus, the function returned FLASH_OK while the
+    flash content remained 0xFF.
+
+    Note the contrast with `flash_program_word`, which already
+    had it right:
+        *(volatile uint32_t *)addr = value;
+        if (*(volatile uint32_t *)addr != value) return FLASH_ERR_VERIFY;
+    The `volatile` qualifier on each access prevents the compiler
+    from folding them.
+
+FIX
+    Made the destination pointer `volatile` in the QEMU sim path:
+
+        volatile uint8_t *dst = (volatile uint8_t *)addr;
+        for (uint32_t i = 0; i < size; ++i) {
+            dst[i] = data[i];
+            if (dst[i] != data[i]) return FLASH_ERR_VERIFY;
+            ...
+        }
+
+    Added a comment block explaining why - so the next person who
+    reads it doesn't think "this volatile is decorative" and rip
+    it out:
+
+        /* `volatile` on the destination pointer prevents the
+         * compiler from folding the readback into the just-written
+         * value (which would silently mask QEMU rejecting the
+         * write on a real-flash region). */
+
+WHY THIS WORKS
+    `volatile` tells the compiler that every access has observable
+    side effects and may not be elided or reordered. Both the store
+    and the load are emitted as actual memory transactions. If the
+    bus drops the store (as QEMU does), the load returns the
+    pre-store value and the comparison fires.
+
+    Note this fix was a PRE-REQUISITE for diagnosing #14. With the
+    optimisation in place, the silent failure mode of QEMU's ROM
+    flash was completely hidden. The volatile fix made the symptom
+    visible, which then enabled the proper architectural fix in #14.
+
+INTERVIEWER ANGLE
+    Classic "non-volatile MMIO" story. The general pattern is: any
+    pointer that aliases hardware-mapped memory (or memory whose
+    semantics differ from plain RAM, including ROM, devices, and
+    DMA buffers) MUST be volatile, or the compiler is licensed to
+    optimise away the very thing the code was checking.
+
+================================================================================
+ 16. crypto.c STREAMED VIA DIRECT POINTER OVER THE SHADOW BOUNDARY
+================================================================================
+
+WHEN
+    During the QEMU shadow design (#14), realised that crypto.c
+    was reading flash via direct pointer arithmetic rather than
+    flash_read(). With a 32 KB-per-slot shadow window, any payload
+    larger than 32 KB would have a base pointer in shadow SRAM but
+    offsets past the window pointing at random SRAM addresses.
+
+SYMPTOM (POTENTIAL)
+    If a future test or production image were larger than the
+    shadow window (32 KB per slot), crypto's CRC and SHA streaming
+    loops would read garbage past the window boundary. Today's
+    test image is 2 KB so the bug didn't fire, but it's a latent
+    landmine.
+
+ROOT CAUSE
+    Original crypto_verify_firmware:
+        const FirmwareHeader_t *hdr = (const FirmwareHeader_t *)slot_addr;
+        const uint8_t *payload = (const uint8_t *)(slot_addr + 512);
+        for (chunked CRC) crc32_update(crc, payload + off, chunk);
+        for (chunked SHA) sha256_update(ctx, payload + off, chunk);
+
+    On the HW build, `payload` is a raw flash address - reads go
+    to the live flash. Fine.
+    On the QEMU build, after #14, `slot_addr` should resolve
+    through the shadow. The casts above bypass `flash_read()` and
+    treat the slot address as if it were directly readable. They
+    work for the first 32 KB (where shadow_byte_ptr returns a
+    shadow pointer) but past that they drop off the end of the
+    shadow array into adjacent RAM.
+
+FIX
+    Refactored crypto.c to:
+    (1) Pull the header into a stack-local copy via flash_read()
+        rather than dereferencing a base pointer:
+
+            FirmwareHeader_t hdr;
+            if (flash_read(slot_addr, &hdr, sizeof(hdr)) != FLASH_OK)
+                return false;
+            if (hdr.magic != FIRMWARE_MAGIC) return false;
+            ...
+
+    (2) Stream the payload through flash_read() into a 1 KB stack
+        buffer, in chunks, both for CRC32 and SHA-256:
+
+            uint8_t buf[VERIFY_CHUNK_BYTES];   // 1024
+            while (remaining > 0U) {
+                uint32_t chunk = min(remaining, VERIFY_CHUNK_BYTES);
+                flash_read(payload_addr, buf, chunk);
+                crc_state = crc32_update(crc_state, buf, chunk);
+                iwdg_kick();
+                payload_addr += chunk;
+                remaining    -= chunk;
+            }
+
+    (3) Added a flash_get_ptr() helper for cases where a stack
+        copy is overkill; the helper returns either a shadow
+        pointer (QEMU) or the raw address (HW). Currently only
+        used as a defensive measure in the header dereference,
+        but available for any future code that needs zero-copy
+        slot access.
+
+WHY THIS WORKS
+    flash_read() (and shadow_aware_read inside it) handles the
+    shadow/ROM boundary at byte granularity, so chunk reads work
+    correctly even when a chunk straddles the end of the shadow
+    window. The 1 KB stack buffer is well under the bootloader's
+    8 KB stack reservation, and is cheap enough that it's worth
+    the simplification. iwdg_kick is called every chunk, so
+    long verifications still feed the watchdog.
+
+    On real hardware, flash_read is a memcpy from memory-mapped
+    flash, so the refactor adds a single memcpy per chunk - small
+    constant overhead, no semantic change.
+
+INTERVIEWER ANGLE
+    The general pattern: when an underlying layer adds an
+    indirection (here: shadow vs ROM), upper layers must use the
+    layer's API rather than the underlying physical address. This
+    is the same lesson behind virtual memory, mmap, and any sort
+    of zero-copy abstraction that needs an escape hatch.
+
+================================================================================
+ 17. OTA TRANSPORT - SERIAL PORT vs TCP SOCKET
+================================================================================
+
+WHEN
+    During tools/ota_server.py and Makefile authoring.
+
+SYMPTOM
+    First version used pyserial on /dev/ttyUSB0-style device names.
+    On Windows the same device shows up as COM3 / COM4 / etc.,
+    requires the user to discover the right number, and the
+    QEMU-side `-serial` option to bridge a UART to a host serial
+    port is platform-specific (`-serial COM3` on Windows,
+    `-serial /dev/ttyS0` on Linux). Friction galore.
+
+ROOT CAUSE
+    Real-hardware OTA legitimately uses serial; QEMU OTA does not
+    have to. QEMU offers `-serial tcp:127.0.0.1:4444,server,nowait`
+    which exposes the chosen UART as a TCP listener on the host.
+    This works identically on Windows, Linux, and macOS.
+
+FIX
+    - Makefile `qemu` target uses
+        -serial mon:stdio                       # USART1: bootloader logs
+        -serial tcp:127.0.0.1:4444,server,nowait # USART2: OTA bridge
+    - tools/ota_server.py defaults to TCP via
+        --tcp 127.0.0.1:4444
+      and falls back to a `--serial COMx`/`/dev/ttyXX` arg for
+      real hardware.
+    - Documented in README.md and docs/build_and_run.md.
+
+WHY THIS WORKS
+    TCP loopback has no notion of baud rate - it's effectively
+    instantaneous - so the OTA timing in QEMU is bound by the
+    bootloader's flash-program-and-verify loop, not the link.
+    For real-hardware testing, the same Python script switches to
+    the serial transport via a single CLI flag.
+
+INTERVIEWER ANGLE
+    Right answer to "why TCP?" is: cross-platform parity for the
+    QEMU testing path; real hardware still uses UART. The
+    underlying frame protocol is unchanged - only the byte
+    transport differs.
+
+================================================================================
+ 18. OTA PUSH FIRED AGAINST RUNNING APP, NOT BOOTLOADER
+================================================================================
+
+WHEN
+    First end-to-end attempt of OTA push after `make qemu`.
+
+SYMPTOM
+    `make qemu` (in terminal A) boots the bootloader, which
+    verifies Slot A and jumps to the demo app. Then
+    `make ota_server` (in terminal B) tries to push v1.1.0 over
+    TCP 4444. Result: timeouts, "START failed after retries".
+
+ROOT CAUSE
+    Mis-modelled the test scenario. The bootloader's OTA receiver
+    runs only when:
+        (a) the bootloader is in recovery mode (both slots failed
+            verification), OR
+        (b) the application has explicitly set
+            SHARED_BOOT_BLOCK.ota_pending and triggered a soft
+            reset to enter the bootloader's OTA path.
+    The currently-running demo app does not implement (b), so
+    after the bootloader jumps to the app, NO ONE is listening on
+    USART2 / TCP 4444.
+
+FIX
+    Two-pronged:
+    (1) Added test_recovery_ota.py that explicitly corrupts Slot A
+        via flash_layout.py --corrupt slotA, boots the resulting
+        flash image in QEMU, sees the bootloader fall into
+        recovery, sends 'U' on TCP 4444 to trigger the OTA
+        receiver, then pushes the signed image. This is the
+        documented "fresh OTA into a known-bad device" flow.
+    (2) Documented the alternative "app-triggered OTA" flow in
+        docs/update_protocol.md and as a TODO in
+        application/include/bootloader_api.h - the API
+        (`bootloader_request_ota_swap()`) is provided; the demo
+        app simply doesn't call it (could be added in a future
+        revision).
+
+WHY THIS WORKS
+    Recovery mode is the canonical "ground-truth" OTA entry point
+    - it's what you fall into when both slots are broken, and it's
+    the one the test harness can engineer reliably from the host.
+    The app-triggered path is documented and the API exists; the
+    feature gap is "demo app doesn't exercise it" not "bootloader
+    can't do it".
+
+INTERVIEWER ANGLE
+    Worth distinguishing the two OTA entry points clearly. Many
+    secure-bootloader designs have BOTH (e.g. the U-Boot fastboot
+    mode and the runtime mender-update mode). Show you understand
+    why both exist and what each is good for.
+
+================================================================================
+ 19. socket.recv() RETURNED PARTIAL BYTES (TCP FRAMING)
+================================================================================
+
+WHEN
+    First run of test_recovery_ota.py.
+
+SYMPTOM
+    `resp = sock.recv(3)` returned `b'\\x06'` - the ACK byte, but
+    only 1 byte. The test then asserted `resp[0] == ACK` (passes)
+    but `len(resp) == 3` (fails, because it's actually 1 byte).
+    Later DATA frames produced random NAKs / garbled SEQs.
+
+ROOT CAUSE
+    Classic TCP framing: socket.recv(n) returns "up to n bytes",
+    not "exactly n bytes". TCP is a byte stream; how the stream
+    is segmented at the IP layer is up to the kernel. The
+    bootloader sends a 3-byte response (ACK + SEQ_lo + SEQ_hi)
+    in one uart_ota_write, but on the host side the kernel may
+    deliver the bytes in multiple recv() calls.
+
+FIX
+    Wrote a `recv_exact()` helper:
+
+        def recv_exact(sock, n, timeout=5.0):
+            buf = b""
+            sock.settimeout(timeout)
+            while len(buf) < n:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    raise TimeoutError(
+                        f"connection closed with {len(buf)}/{n} received"
+                    )
+                buf += chunk
+            return buf
+
+    Replaced every `sock.recv(N)` in the test with `recv_exact(sock, N)`.
+    Added the same idea to tools/ota_server.py (the production-flow
+    OTA tool) so it's robust against the same issue on real
+    hardware where USART transport may also fragment.
+
+WHY THIS WORKS
+    Loop until exactly n bytes have arrived OR the connection
+    closes (which is now distinguished from "still waiting"). The
+    timeout protects against a hung peer.
+
+INTERVIEWER ANGLE
+    Universally applicable lesson - applies to TCP, USART with DMA
+    half/full transfer interrupts, USB CDC, anything else that's
+    a byte-stream rather than message-oriented. Frame-level
+    protocols always need an "accumulate exactly N bytes" helper.
+
+================================================================================
+ 20. embed_pubkey.py AND textwrap.dedent INDENTATION
+================================================================================
+
+WHEN
+    First run of `make keys`.
+
+SYMPTOM
+    The auto-generated `bootloader/include/public_key.h` had
+    inconsistent indentation - some lines were flush-left, others
+    indented by 4 or 8 spaces. The C compiler accepted it
+    (whitespace-insensitive), but it looked unprofessional in code
+    review.
+
+ROOT CAUSE
+    First version used `textwrap.dedent()` on a triple-quoted
+    template string. dedent calculates the common leading
+    whitespace of all non-empty lines and strips it. Mixing tab
+    and space, or having one line with no leading whitespace
+    (e.g. a blank line), causes dedent to under-strip and produces
+    the inconsistent output.
+
+FIX
+    Replaced the dedent-based template with explicit string
+    construction in tools/embed_pubkey.py:
+
+        out = []
+        out.append("#ifndef PUBLIC_KEY_H")
+        out.append("#define PUBLIC_KEY_H")
+        out.append("")
+        out.append("#include <stdint.h>")
+        ...
+        out.append("static const uint8_t public_key_xy[64] = {")
+        for i, b in enumerate(xy_bytes):
+            ...
+        out.append("};")
+        out.append("#endif")
+        f.write("\n".join(out) + "\n")
+
+    Result: every line starts at column 0 (or with explicit
+    indentation), no dedent surprises.
+
+WHY THIS WORKS
+    Removes the dependence on textwrap.dedent's whitespace-
+    counting heuristic. The output is exactly what the code
+    appends.
+
+INTERVIEWER ANGLE
+    Minor style issue, but a good "I noticed and fixed details
+    that aren't strictly bugs" data point.
+
+================================================================================
+ 21. MISSING #include <stddef.h> FOR offsetof
+================================================================================
+
+WHEN
+    During boot_config.c and crypto.c authoring, when the static
+    asserts that use `offsetof()` failed to compile.
+
+SYMPTOM
+    Compiler error: `'offsetof' undeclared (first use in this
+    function)`.
+
+ROOT CAUSE
+    `offsetof()` is declared in `<stddef.h>`. Both files indirectly
+    pulled in some of the C standard via `<string.h>` (for memcpy/
+    memset), which on glibc happens to include <stddef.h> as a
+    transitive dependency. On the ARM newlib-nano headers it does
+    NOT - so the build fails on the embedded toolchain even though
+    a host build would succeed.
+
+FIX
+    Added `#include <stddef.h>` explicitly in:
+        - bootloader/src/boot_config.c
+        - bootloader/src/crypto.c
+        - bootloader/src/flash_driver.c (for uintptr_t)
+
+    Plus a project-wide rule in .cursorrules: "include the header
+    that declares each name you use, even if a transitive include
+    happens to provide it on one toolchain".
+
+WHY THIS WORKS
+    Direct includes are the only portable way to use C standard
+    names. Transitive availability is not guaranteed by the
+    standard.
+
+INTERVIEWER ANGLE
+    Standard "embedded build vs host build" friction. The fix is
+    cheap; the lesson is that the build system should aim for
+    "compiles cleanly with both newlib-nano and glibc" as a
+    portability discipline.
+
+================================================================================
+ 22. ITERATION CAP DEFENSE-IN-DEPTH IN pick_slot_to_boot
+================================================================================
+
+WHEN
+    During main.c review after issue #13 was fixed.
+
+SYMPTOM (POTENTIAL)
+    The verify-active loop in `pick_slot_to_boot` has multiple
+    `continue` paths (slot switch on attempts > 3, retry after
+    config save). A logic bug that caused `boot_attempts` not to
+    reset, or that re-set the attempts mid-loop, could turn into
+    an infinite loop and a watchdog reboot.
+
+ROOT CAUSE
+    Defense-in-depth issue rather than a known concrete bug. State
+    machines with multiple `continue` arms and shared mutable
+    state are a known source of accidental infinite loops.
+
+FIX
+    Bounded the loop with an explicit iteration cap:
+
+        for (unsigned iter = 0; iter < MAX_SWAP_RETRIES; ++iter) {
+            ...
+            continue;   /* re-verify */
+            ...
+        }
+        uart_log_puts("ERR : MAX_SWAP_RETRIES exceeded; entering recovery\r\n");
+        return 0U;
+
+    `MAX_SWAP_RETRIES` is set to 4 (a few iterations of legitimate
+    swap-then-retry, with margin). On exit the bootloader falls
+    into recovery mode rather than spinning.
+
+WHY THIS WORKS
+    Hard guarantees termination of `pick_slot_to_boot` regardless
+    of what the loop body does to `cfg`. Worst case the device
+    enters recovery and waits for human intervention.
+
+INTERVIEWER ANGLE
+    Showcases defense-in-depth thinking - "even if my logic is
+    wrong, what's the worst that can happen?". Same idea behind
+    DMA "max transfer count" guards and TCP RST-after-keepalive.
+
+================================================================================
+ 23. HW BUILD STILL PAYS THE SRAM-SHADOW TAX IN THE LINKER
+================================================================================
+
+WHEN
+    During QEMU shadow design (#14), specifically when reducing
+    SRAM region size in the linker script.
+
+SYMPTOM (DESIGN)
+    To reserve 0x2000E000 - 0x2001FFEF for the shadow, I shortened
+    the SRAM region in linker_bootloader.ld from 128K-16 to 56K.
+    This is correct for the QEMU build, but the same linker script
+    is used for the HW build. So the HW bootloader, which doesn't
+    HAVE a shadow, only has 56 KB of SRAM available for stack/heap/
+    bss instead of 128 KB.
+
+ROOT CAUSE
+    A single linker script for two profiles. The shadow region is
+    only meaningful when QEMU_FLASH_SIM is defined, but the linker
+    has no preprocessor (linker scripts are processed by the
+    linker, not the C compiler).
+
+FIX
+    Two options were considered:
+        (a) Generate a different linker script per build profile
+            (e.g. linker_bootloader_qemu.ld vs
+            linker_bootloader_hw.ld).
+        (b) Accept the 56 KB upper bound on the HW bootloader and
+            document it.
+
+    Chose (b) on the grounds that:
+        - The bootloader uses ~10 KB of SRAM in the HW build
+          (.bss = 20 B, ._user_heap_stack = 9220 B, .data = 0 B).
+        - 56 KB is a 5.6× margin over the actual usage.
+        - The "wasted" 70 KB is not used by the application either
+          (the app linker still grants the full 128K-16) - the
+          waste is purely in the bootloader phase, which doesn't
+          have anything to put there.
+    Documented the trade-off in docs/architecture.md and
+    ENGINEERING_RETROSPECTIVE.txt (this file).
+
+WHY (b) WORKS
+    The HW bootloader's actual SRAM footprint (~10 KB) leaves
+    >40 KB of headroom in 56 KB. The application linker is
+    independent and grants the full 128K-16 to the running app, so
+    the "waste" never affects user code. If the bootloader ever
+    grew beyond ~40 KB of SRAM usage (e.g. a future feature that
+    needs a large work buffer), we'd switch to option (a) for the
+    additional cost of a build-time linker-script-generator.
+
+WHY (a) WAS NOT NEEDED
+    Cost-benefit: maintaining two linker scripts (~120 lines each)
+    that differ only in one MEMORY directive doubles the surface
+    area for "I edited one and forgot the other" bugs. The current
+    bootloader has a 5× headroom on a value that doesn't grow with
+    feature work; not worth it.
+
+INTERVIEWER ANGLE
+    "I picked the boring solution because the cost was negligible
+    and the alternative had a maintenance penalty I didn't want to
+    pay" is a perfectly good engineering answer. Show you considered
+    both, and have a clear trigger ("if RAM use > X, switch") for
+    revisiting the decision.
+
+================================================================================
+ SUMMARY TABLE - ISSUES BY SEVERITY
+================================================================================
+
+  CRITICAL (would have shipped a broken product):
+    #4   Cortex-M VTOR alignment - HardFault on real silicon
+    #14  QEMU flash is ROM - bootloader untestable as written
+    #15  Compiler optimised away verify - hid #14 entirely
+
+  HIGH (would have caused production incidents):
+    #5   SRAM size 192 vs 128 KB - phantom RAM region
+    #8   ECDSA r||s vs DER - silent verification failures
+    #9   Canonical signed region - signer/verifier disagreement
+    #10  Boot config CRC ordering - power-loss data corruption
+    #19  socket.recv partial bytes - test framing bugs
+
+  MEDIUM (correctness on edge cases):
+    #13a Post-OTA re-verify and revert
+    #13b boot_attempts reset before re-entry
+    #13c App confirmation check after config load
+    #13d Recovery mode as a usable terminal state
+    #16  crypto.c shadow boundary - works for test images,
+         would have broken for >32 KB images
+
+  LOW (developer experience / portability):
+    #1   Toolchain on PATH
+    #2   Makefile shell portability
+    #3   Cross-platform sub-targets
+    #6   QEMU machine choice
+    #11  STM32F4 sector 4 erase granularity
+    #12  SharedBootBlock placement (handled by spec but called out)
+    #17  TCP vs serial OTA transport
+    #18  OTA flow misunderstanding (test design fix)
+    #20  embed_pubkey.py textwrap.dedent
+    #21  Missing #include <stddef.h>
+
+  DEFENSIVE / DESIGN:
+    #7   mbedTLS vs micro-ecc sizing
+    #22  Iteration cap defense-in-depth
+    #23  Linker script trade-off
+
+================================================================================
+ KEY TAKEAWAYS (FOR INTERVIEW NARRATIVES)
+================================================================================
+
+1. SIMULATORS ARE NOT TEST ENVIRONMENTS.
+   Both #4 (VTOR alignment) and #14 (flash is ROM) are bugs that
+   QEMU either masks or amplifies. Any non-trivial firmware project
+   should validate against at least two of {QEMU, Renode, real
+   hardware} - they catch different things.
+
+2. COMPILE-TIME ASSERTIONS ARE THE CHEAPEST DEFENSE.
+   _Static_assert in common/memory_map.h caught issue #5
+   immediately. Adding more of them throughout the project is
+   high-leverage work.
+
+3. NON-VOLATILE POINTERS TO HARDWARE-MAPPED MEMORY ARE A LIE.
+   #15 was the canonical example. The compiler is allowed to do
+   exactly what its model of memory says, and that model treats
+   plain pointers as ordinary RAM. `volatile` is the contract.
+
+4. ATOMIC SINGLE-WORD COMMITS ARE THE SECRET TO POWER-LOSS SAFETY.
+   #10's "CRC field programmed last" is the same pattern as ZFS
+   uberblocks, SQLite journals, and database WAL commits. Apply
+   it to any persistent record where torn writes are a hazard.
+
+5. WHEN A LIBRARY DOES THE WRONG THING FOR YOUR CONSTRAINT, BUILD
+   THE 200-LINE THING THAT DOES THE RIGHT THING.
+   #7 was the mbedTLS-vs-micro-ecc decision. micro-ecc is a tenth
+   the size and does exactly the verification you need. The win is
+   the constraint, not the elegance.
+
+6. FAILURE MODES YOU CAN'T REPRODUCE WILL BITE YOU IN PRODUCTION.
+   #14 was unmaskeable on QEMU once #15 was fixed. Building the
+   shadow felt like a lot of code (~150 lines + linker change),
+   but without it the entire test suite would have been a fiction.
+   Reproducible-on-CI tests are non-negotiable.
+
+7. "WORKS ON ONE PLATFORM" IS NOT A FEATURE.
+   #1, #2, #3, #17, #19, #21 are all Windows-vs-POSIX or
+   embedded-vs-host portability issues. None individually is
+   exciting. Together they're the difference between "the
+   interviewer can clone and run it" and "the interviewer says
+   'eh, I'll trust you that it works'".
+
+================================================================================
+ END OF DOCUMENT
+================================================================================
