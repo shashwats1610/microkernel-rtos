@@ -8,9 +8,43 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "block.h"
 #include "scheduler.h"
 
 extern volatile TCB_t *current_tcb;
+
+static void _wait_unlink(semaphore_t *sem, TCB_t *t)
+{
+    TCB_t *prev;
+    TCB_t *walk;
+
+    if ((sem == NULL) || (t == NULL) || (sem->wait_head == NULL)) {
+        return;
+    }
+
+    prev = NULL;
+    walk = sem->wait_head;
+    while (walk != NULL) {
+        if (walk == t) {
+            if (prev == NULL) {
+                sem->wait_head = t->mutex_wait_next;
+            }
+            else {
+                prev->mutex_wait_next = t->mutex_wait_next;
+            }
+            if (t == sem->wait_tail) {
+                sem->wait_tail = prev;
+            }
+            if (sem->wait_head == NULL) {
+                sem->wait_tail = NULL;
+            }
+            t->mutex_wait_next = NULL;
+            return;
+        }
+        prev = walk;
+        walk = walk->mutex_wait_next;
+    }
+}
 
 static void _wait_enqueue(semaphore_t *sem, TCB_t *t)
 {
@@ -43,14 +77,36 @@ static TCB_t *_wait_pop_head(semaphore_t *sem)
     return w;
 }
 
-/**
- * @brief Initialize counting semaphore.
- *
- * @param sem Semaphore object.
- * @param initial Initial count.
- * @param max_count Maximum count value.
- * @return Status.
- */
+void semaphore_wake_timeout(TCB_t *t)
+{
+    semaphore_t *sem;
+
+    if (t == NULL) {
+        return;
+    }
+
+    sem = (semaphore_t *)t->block_object;
+    if (sem != NULL) {
+        _wait_unlink(sem, t);
+    }
+
+    t->block_reason = BLOCK_NONE;
+    t->block_object = NULL;
+    t->block_wake_status = RTOS_ERR_TIMEOUT;
+    t->state = TASK_STATE_READY;
+    (void)scheduler_add_task(t);
+}
+
+void semaphore_detach_waiter(semaphore_t *sem, TCB_t *t)
+{
+    if ((sem == NULL) || (t == NULL)) {
+        return;
+    }
+
+    _wait_unlink(sem, t);
+    t->mutex_wait_next = NULL;
+}
+
 rtos_status_t semaphore_init(semaphore_t *sem, uint32_t initial, uint32_t max_count)
 {
     if ((sem == NULL) || (max_count == 0u) || (initial > max_count)) {
@@ -63,13 +119,6 @@ rtos_status_t semaphore_init(semaphore_t *sem, uint32_t initial, uint32_t max_co
     return RTOS_OK;
 }
 
-/**
- * @brief Initialize binary semaphore (0 or 1).
- *
- * @param sem Semaphore object.
- * @param initially_available True if starting available.
- * @return Status.
- */
 rtos_status_t semaphore_init_binary(semaphore_t *sem, bool initially_available)
 {
     uint32_t initial;
@@ -78,16 +127,10 @@ rtos_status_t semaphore_init_binary(semaphore_t *sem, bool initially_available)
     return semaphore_init(sem, initial, 1u);
 }
 
-/**
- * @brief Wait for semaphore (decrement). Blocks when count is zero.
- *
- * @param sem Semaphore object.
- * @param timeout_ticks Timeout in ticks (0 = infinite).
- * @return Status.
- */
 rtos_status_t semaphore_wait(semaphore_t *sem, uint32_t timeout_ticks)
 {
     TCB_t *self;
+    rtos_status_t st;
 
     if (sem == NULL) {
         return RTOS_ERR_PARAM;
@@ -98,8 +141,6 @@ rtos_status_t semaphore_wait(semaphore_t *sem, uint32_t timeout_ticks)
         return RTOS_ERR_STATE;
     }
 
-    (void)timeout_ticks;
-
     for (;;) {
         __asm volatile ("cpsid i" ::: "memory");
 
@@ -109,25 +150,17 @@ rtos_status_t semaphore_wait(semaphore_t *sem, uint32_t timeout_ticks)
             return RTOS_OK;
         }
 
-        self->state = TASK_STATE_BLOCKED;
-        scheduler_remove_task(self);
         _wait_enqueue(sem, self);
 
         __asm volatile ("cpsie i" ::: "memory");
-        scheduler_mark_reschedule();
 
-        while (self->state == TASK_STATE_BLOCKED) {
-            __asm volatile ("nop");
+        st = rtos_block_current(timeout_ticks, BLOCK_SEMAPHORE, sem);
+        if (st == RTOS_ERR_TIMEOUT) {
+            return RTOS_ERR_TIMEOUT;
         }
     }
 }
 
-/**
- * @brief Post semaphore (increment) up to max_count.
- *
- * @param sem Semaphore object.
- * @return Status.
- */
 rtos_status_t semaphore_post(semaphore_t *sem)
 {
     TCB_t *wake;
@@ -146,6 +179,8 @@ rtos_status_t semaphore_post(semaphore_t *sem)
     sem->count++;
     wake = _wait_pop_head(sem);
     if (wake != NULL) {
+        wake->block_reason = BLOCK_NONE;
+        wake->block_object = NULL;
         wake->state = TASK_STATE_READY;
         (void)scheduler_add_task(wake);
     }

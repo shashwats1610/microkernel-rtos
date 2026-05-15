@@ -1,0 +1,49 @@
+Cortex-M RTOS — Engineering Retrospective
+=========================================
+
+Why from scratch
+----------------
+Built to understand PendSV/SVC scheduling, priority inheritance, and IPC integration
+at the register level — not to replace FreeRTOS or Zephyr for production. Those kernels
+offer ports, drivers, and certification artifacts; this project trades breadth for depth.
+
+Key design choices
+------------------
+1. Eight priority buckets (priority >> 5) with circular ready rings — O(1) insert/remove,
+   predictable behavior for interviews.
+2. PendSV defers context switch; SysTick drives tick, delayed wake, timers, canaries,
+   and time-slice preemption.
+3. Static heap pool (32 KiB) with first-fit + coalesce — no malloc in ISRs.
+4. Modular source tree (core/sync/ipc) in a single linked image (monolithic deploy).
+
+Sprint improvements (completion pass)
+-------------------------------------
+- Tick-based timeouts on mutex, semaphore, message queue (RTOS_ERR_TIMEOUT).
+- PI migrates owner TCB between ready buckets via scheduler_rebucket_task().
+- RTOS_TIME_SLICE_TICKS wired in SysTick path.
+- task_delete detaches blocked tasks from wait lists.
+- NVIC priority programming, semihosting console (QEMU), USART2 stub (hw).
+- Automated tests: scripts/run_tests.py + GitHub Actions.
+
+5-minute interview walkthrough
+------------------------------
+1. Reset → startup_stm32f407xx.s: stack, .data/.bss, main.
+2. main → task_init (heap, scheduler, idle) → task_create → rtos_start.
+3. rtos_start: SystemInitClock, SysTick_Config, cpsie i, svc 0.
+4. SVC_Handler: scheduler_get_next, restore first task PSP frame.
+5. SysTick_Handler: tick++, rtos_wake_delayed, sw_timer_tick_process,
+   stack canary scan, scheduler_time_slice_tick, PendSV pend.
+6. PendSV_Handler (context_switch.s): save R4–R11, scheduler_get_next,
+   restore next task.
+7. mutex_lock contention: _apply_pi boosts owner priority and re-buckets ready ring.
+
+Talking points
+--------------
+- Timeouts: wake_time on TCB + block_reason dispatches mutex/semaphore/queue timeout.
+- PI: owner priority and ready-queue position stay consistent after boost.
+- Testing: firmware sets volatile pass flags; GDB batch in run_tests.py reads them.
+
+Production gaps (honest)
+------------------------
+- MPU, separate address spaces, fault logging, watchdog, trace (SWO/RTT)
+- Formal WCET, priority ceiling protocol options, certified config/build

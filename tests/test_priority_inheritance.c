@@ -16,6 +16,7 @@ static mutex_t g_mtx;
 volatile uint32_t g_pi_high_enter_tick;
 volatile uint32_t g_pi_low_hold_tick;
 volatile uint32_t g_pi_test_note;
+volatile uint32_t g_pi_test_pass;
 
 static void task_low(void);
 static void task_mid(void);
@@ -36,6 +37,7 @@ int main(void)
     g_pi_high_enter_tick = 0u;
     g_pi_low_hold_tick = 0u;
     g_pi_test_note = 0u;
+    g_pi_test_pass = 0u;
 
     (void)mutex_init(&g_mtx);
 
@@ -89,6 +91,7 @@ static void task_high(void)
         g_pi_high_enter_tick = rtos_get_tick();
         (void)mutex_lock(&g_mtx, 0u);
         g_pi_test_note = 1u;
+        g_pi_test_pass = 1u;
         (void)mutex_unlock(&g_mtx);
         (void)task_delay(50u);
     }

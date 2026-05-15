@@ -9,9 +9,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "block.h"
 #include "heap.h"
+#include "msgqueue.h"
+#include "mutex.h"
 #include "rtos_config.h"
 #include "scheduler.h"
+#include "semaphore.h"
 #include "sw_timer.h"
 
 #define NVIC_PRIO_BITS       (4u)
@@ -43,6 +47,40 @@ static void _registry_add(TCB_t *tcb)
     }
 }
 
+static void _registry_remove(TCB_t *tcb)
+{
+    uint32_t i;
+    uint32_t j;
+
+    for (i = 0; i < task_registry_count; i++) {
+        if (task_registry[i] == tcb) {
+            for (j = i; j + 1u < task_registry_count; j++) {
+                task_registry[j] = task_registry[j + 1u];
+            }
+            task_registry_count--;
+            return;
+        }
+    }
+}
+
+static void _detach_blocked_task(TCB_t *tcb)
+{
+    if (tcb->block_reason == BLOCK_MUTEX) {
+        mutex_detach_waiter((mutex_t *)tcb->block_object, tcb);
+    }
+    else if (tcb->block_reason == BLOCK_SEMAPHORE) {
+        semaphore_detach_waiter((semaphore_t *)tcb->block_object, tcb);
+    }
+    else if ((tcb->block_reason == BLOCK_MSG_SEND) ||
+             (tcb->block_reason == BLOCK_MSG_RECV)) {
+        msgqueue_detach_waiter((msg_queue_t *)tcb->block_object, tcb);
+    }
+
+    tcb->block_reason = BLOCK_NONE;
+    tcb->block_object = NULL;
+    tcb->blocked_on_mutex = NULL;
+}
+
 static uint32_t *_build_initial_stack(uint32_t *stack_high_exclusive,
                                     void (*task_func)(void))
 {
@@ -50,7 +88,6 @@ static uint32_t *_build_initial_stack(uint32_t *stack_high_exclusive,
 
     sp = stack_high_exclusive;
 
-    /* Hardware stacked frame (low address .. high): R0,R1,R2,R3,R12,LR,PC,xPSR */
     sp -= 8;
     sp[0] = 0u;
     sp[1] = 0u;
@@ -61,7 +98,6 @@ static uint32_t *_build_initial_stack(uint32_t *stack_high_exclusive,
     sp[6] = (uint32_t)task_func;
     sp[7] = 0x01000000u;
 
-    /* Manual registers R4-R11 below hardware frame */
     sp -= 8;
     sp[0] = 0u;
     sp[1] = 0u;
@@ -97,14 +133,13 @@ static rtos_status_t _task_build_common(TCB_t *tcb, void (*task_func)(void))
     tcb->blocked_on_mutex = NULL;
     tcb->mutex_wait_next = NULL;
     tcb->time_slice_counter = 0u;
+    tcb->block_reason = BLOCK_NONE;
+    tcb->block_object = NULL;
+    tcb->block_wake_status = RTOS_OK;
+    tcb->wake_time = UINT32_MAX;
     return RTOS_OK;
 }
 
-/**
- * @brief Initialize kernel task subsystem (calls scheduler + idle creation).
- *
- * @return Status.
- */
 rtos_status_t task_init(void)
 {
     uint32_t idle_stack_bytes;
@@ -140,15 +175,6 @@ rtos_status_t task_init(void)
     return RTOS_OK;
 }
 
-/**
- * @brief Create a new task.
- *
- * @param task_func Pointer to task entry function.
- * @param priority Task priority (0 = highest logical per config mapping).
- * @param stack_size Stack size in bytes (minimum @ref RTOS_MIN_STACK_SIZE).
- * @param name Task name (max @ref RTOS_TASK_NAME_MAX including null).
- * @return Pointer to TCB, or NULL on failure.
- */
 TCB_t *task_create(void (*task_func)(void), uint8_t priority, uint32_t stack_size,
                    const char *name)
 {
@@ -210,25 +236,10 @@ TCB_t *task_create(void (*task_func)(void), uint8_t priority, uint32_t stack_siz
 volatile const char *g_rtos_stack_overflow_task_name;
 volatile uint32_t g_rtos_stack_overflow_canary;
 
-/**
- * @brief Delete a task (caller must not delete currently running task from itself).
- *
- * @param tcb Task control block.
- * @return Status.
- */
 rtos_status_t task_delete(TCB_t *tcb)
 {
     if (tcb == NULL) {
         return RTOS_ERR_PARAM;
-    }
-
-    /*
-     * Proper implementation would scan every mutex, semaphore, and message queue
-     * to detach @a tcb from wait lists. For this portfolio scope, callers must
-     * only delete tasks that are READY or SUSPENDED (not blocked on a primitive).
-     */
-    if (tcb->state == TASK_STATE_BLOCKED) {
-        return RTOS_ERR_STATE;
     }
 
     if (tcb == idle_tcb) {
@@ -239,16 +250,23 @@ rtos_status_t task_delete(TCB_t *tcb)
         return RTOS_ERR_STATE;
     }
 
+    __asm volatile ("cpsid i" ::: "memory");
+
+    if (tcb->state == TASK_STATE_BLOCKED) {
+        _detach_blocked_task(tcb);
+    }
+
     scheduler_remove_task(tcb);
     tcb->state = TASK_STATE_TERMINATED;
+    _registry_remove(tcb);
+
     heap_free(tcb->stack_base);
     heap_free(tcb);
+
+    __asm volatile ("cpsie i" ::: "memory");
     return RTOS_OK;
 }
 
-/**
- * @brief Yield CPU to the scheduler.
- */
 void task_yield(void)
 {
     scheduler_mark_reschedule();
@@ -256,26 +274,15 @@ void task_yield(void)
 
 static volatile uint32_t s_rtos_tick_count;
 
-/**
- * @brief Number of elapsed system ticks (1 ms default).
- *
- * @return Tick count (wraps uint32_t).
- */
 uint32_t rtos_get_tick(void)
 {
     return s_rtos_tick_count;
 }
 
-/**
- * @brief Delay current task for a number of ticks.
- *
- * @param ticks Number of system ticks (must be > 0).
- * @return Status.
- */
 rtos_status_t task_delay(uint32_t ticks)
 {
     TCB_t *self;
-    uint32_t wake;
+    rtos_status_t st;
 
     if (ticks == 0u) {
         return RTOS_ERR_PARAM;
@@ -286,27 +293,12 @@ rtos_status_t task_delay(uint32_t ticks)
         return RTOS_ERR_STATE;
     }
 
-    __asm volatile ("cpsid i" ::: "memory");
-    wake = s_rtos_tick_count + ticks;
-    self->wake_time = wake;
-    self->state = TASK_STATE_BLOCKED;
-    scheduler_remove_task(self);
-    __asm volatile ("cpsie i" ::: "memory");
-
-    scheduler_mark_reschedule();
-
-    while (self->state == TASK_STATE_BLOCKED) {
-        __NOP();
-    }
-
-    return RTOS_OK;
+    st = rtos_block_current(ticks, BLOCK_DELAY, NULL);
+    return st;
 }
 
 void rtos_tick_increment(void);
 
-/**
- * @brief Wake delayed tasks whose wake time has elapsed.
- */
 void rtos_wake_delayed(void)
 {
     uint32_t i;
@@ -321,18 +313,30 @@ void rtos_wake_delayed(void)
             continue;
         }
 
-        if ((t->state == TASK_STATE_BLOCKED) && (now >= t->wake_time)) {
+        if ((t->state != TASK_STATE_BLOCKED) || (t->wake_time == UINT32_MAX) ||
+            (now < t->wake_time)) {
+            continue;
+        }
+
+        if (t->block_reason == BLOCK_DELAY) {
+            t->block_reason = BLOCK_NONE;
+            t->block_object = NULL;
             t->state = TASK_STATE_READY;
-            if (scheduler_add_task(t) != RTOS_OK) {
-                /* duplicate safety */
-            }
+            (void)scheduler_add_task(t);
+        }
+        else if (t->block_reason == BLOCK_MUTEX) {
+            mutex_wake_timeout(t);
+        }
+        else if (t->block_reason == BLOCK_SEMAPHORE) {
+            semaphore_wake_timeout(t);
+        }
+        else if ((t->block_reason == BLOCK_MSG_SEND) ||
+                 (t->block_reason == BLOCK_MSG_RECV)) {
+            msgqueue_wake_timeout(t);
         }
     }
 }
 
-/**
- * @brief Check stack canaries for all registered tasks (called from SysTick).
- */
 void rtos_stack_check_all(void)
 {
     uint32_t i;
@@ -348,10 +352,6 @@ void rtos_stack_check_all(void)
 
         base = t->stack_base;
         if (*base != RTOS_STACK_CANARY) {
-            /*
-             * Stop here under GDB: inspect g_rtos_stack_overflow_task_name and
-             * g_rtos_stack_overflow_canary. Production code would log or reset.
-             */
             g_rtos_stack_overflow_task_name = t->name;
             g_rtos_stack_overflow_canary = *base;
             while (1) {
@@ -360,9 +360,6 @@ void rtos_stack_check_all(void)
     }
 }
 
-/**
- * @brief Kernel SysTick tick hook (increment counter).
- */
 void rtos_tick_increment(void)
 {
     s_rtos_tick_count++;
@@ -387,11 +384,6 @@ extern void SystemInitClock(void);
 extern void nvic_set_priority(int32_t irqn, uint32_t preempt_prio);
 extern uint32_t SysTick_Config(uint32_t ticks);
 
-/**
- * @brief Enter multitasking: configure SysTick and perform first dispatch.
- *
- * @return Does not return if successful.
- */
 rtos_status_t rtos_start(void)
 {
     if (idle_tcb == NULL) {
@@ -400,8 +392,9 @@ rtos_status_t rtos_start(void)
 
     SystemInitClock();
 
-    nvic_set_priority(-14, (1u << (NVIC_PRIO_BITS - 1u)));
-    nvic_set_priority(-7, (uint32_t)(1u << NVIC_PRIO_BITS));
+    /* SysTick (-1): medium priority; PendSV (-2): lowest (defer switch). */
+    nvic_set_priority(-1, (1u << (NVIC_PRIO_BITS - 1u)));
+    nvic_set_priority(-2, (uint32_t)((1u << NVIC_PRIO_BITS) - 1u));
 
     if (SysTick_Config(SystemCoreClock / RTOS_TICK_RATE_HZ) != 0u) {
         return RTOS_ERR_STATE;

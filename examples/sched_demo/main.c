@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief Minimal multitasking sanity check (delay/yield path).
+ * @brief Scheduling demo: task_delay and task_yield (no GPIO).
  */
 
 #include <stddef.h>
@@ -9,11 +9,6 @@
 
 static void worker(void);
 
-/**
- * @brief Application entry called from startup after hardware reset.
- *
- * @return Never.
- */
 int main(void)
 {
     if (task_init() != RTOS_OK) {

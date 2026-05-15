@@ -8,16 +8,12 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "block.h"
 #include "rtos_config.h"
 #include "scheduler.h"
 
 extern volatile TCB_t *current_tcb;
 
-/**
- * @brief Smallest numeric priority among waiters (= highest scheduling urgency).
- *
- * Priority 0 = highest; we want the minimum priority value across the wait list.
- */
 static uint8_t _min_wait_priority_value(const mutex_t *m)
 {
     uint8_t min_pri;
@@ -31,7 +27,6 @@ static uint8_t _min_wait_priority_value(const mutex_t *m)
     min_pri = w->priority;
     w = w->mutex_wait_next;
     while (w != NULL) {
-        /* Priority 0 = highest, so we want MINIMUM priority value */
         if (w->priority < min_pri) {
             min_pri = w->priority;
         }
@@ -44,6 +39,8 @@ static void _apply_pi(mutex_t *m)
 {
 #if RTOS_MUTEX_PRIORITY_INHERITANCE
     TCB_t *owner;
+    uint8_t old_bucket;
+    uint8_t new_bucket;
 
     owner = m->owner;
     if ((owner == NULL) || (m->wait_head == NULL)) {
@@ -54,13 +51,15 @@ static void _apply_pi(mutex_t *m)
         uint8_t hp;
 
         hp = _min_wait_priority_value(m);
-        /* Boost owner to most urgent waiter: smaller numeric priority wins */
         if (hp < owner->priority) {
+            old_bucket = owner->prio_bucket;
             owner->priority = hp;
             owner->prio_bucket = (uint8_t)(hp >> 5);
             if (owner->prio_bucket >= RTOS_NUM_PRIORITIES) {
                 owner->prio_bucket = RTOS_NUM_PRIORITIES - 1u;
             }
+            new_bucket = owner->prio_bucket;
+            scheduler_rebucket_task(owner, old_bucket, new_bucket);
         }
     }
 #else
@@ -70,12 +69,53 @@ static void _apply_pi(mutex_t *m)
 
 static void _restore_owner_priority(TCB_t *tcb)
 {
-    if (tcb != NULL) {
-        tcb->priority = tcb->base_priority;
-        tcb->prio_bucket = (uint8_t)(tcb->base_priority >> 5);
-        if (tcb->prio_bucket >= RTOS_NUM_PRIORITIES) {
-            tcb->prio_bucket = RTOS_NUM_PRIORITIES - 1u;
+    uint8_t old_bucket;
+    uint8_t new_bucket;
+
+    if (tcb == NULL) {
+        return;
+    }
+
+    old_bucket = tcb->prio_bucket;
+    tcb->priority = tcb->base_priority;
+    tcb->prio_bucket = (uint8_t)(tcb->base_priority >> 5);
+    if (tcb->prio_bucket >= RTOS_NUM_PRIORITIES) {
+        tcb->prio_bucket = RTOS_NUM_PRIORITIES - 1u;
+    }
+    new_bucket = tcb->prio_bucket;
+    scheduler_rebucket_task(tcb, old_bucket, new_bucket);
+}
+
+static void _wait_unlink(mutex_t *m, TCB_t *t)
+{
+    TCB_t *prev;
+    TCB_t *walk;
+
+    if ((m == NULL) || (t == NULL) || (m->wait_head == NULL)) {
+        return;
+    }
+
+    prev = NULL;
+    walk = m->wait_head;
+    while (walk != NULL) {
+        if (walk == t) {
+            if (prev == NULL) {
+                m->wait_head = t->mutex_wait_next;
+            }
+            else {
+                prev->mutex_wait_next = t->mutex_wait_next;
+            }
+            if (t == m->wait_tail) {
+                m->wait_tail = prev;
+            }
+            if (m->wait_head == NULL) {
+                m->wait_tail = NULL;
+            }
+            t->mutex_wait_next = NULL;
+            return;
         }
+        prev = walk;
+        walk = walk->mutex_wait_next;
     }
 }
 
@@ -106,13 +146,12 @@ static TCB_t *_wait_pop_highest(mutex_t *m)
     best = m->wait_head;
     best_prev = NULL;
     prev = NULL;
-        walk = m->wait_head;
-        while (walk != NULL) {
-            /* Priority 0 = highest, so we want MINIMUM priority value */
-            if (walk->priority < best->priority) {
-                best = walk;
-                best_prev = prev;
-            }
+    walk = m->wait_head;
+    while (walk != NULL) {
+        if (walk->priority < best->priority) {
+            best = walk;
+            best_prev = prev;
+        }
         prev = walk;
         walk = walk->mutex_wait_next;
     }
@@ -134,12 +173,38 @@ static TCB_t *_wait_pop_highest(mutex_t *m)
     return best;
 }
 
-/**
- * @brief Initialize mutex object (not locked).
- *
- * @param m Mutex instance.
- * @return Status.
- */
+void mutex_wake_timeout(TCB_t *t)
+{
+    mutex_t *m;
+
+    if (t == NULL) {
+        return;
+    }
+
+    m = (mutex_t *)t->block_object;
+    if (m != NULL) {
+        _wait_unlink(m, t);
+    }
+
+    t->blocked_on_mutex = NULL;
+    t->block_reason = BLOCK_NONE;
+    t->block_object = NULL;
+    t->block_wake_status = RTOS_ERR_TIMEOUT;
+    t->state = TASK_STATE_READY;
+    (void)scheduler_add_task(t);
+}
+
+void mutex_detach_waiter(mutex_t *m, TCB_t *t)
+{
+    if ((m == NULL) || (t == NULL)) {
+        return;
+    }
+
+    _wait_unlink(m, t);
+    t->blocked_on_mutex = NULL;
+    t->mutex_wait_next = NULL;
+}
+
 rtos_status_t mutex_init(mutex_t *m)
 {
     if (m == NULL) {
@@ -150,16 +215,10 @@ rtos_status_t mutex_init(mutex_t *m)
     return RTOS_OK;
 }
 
-/**
- * @brief Lock mutex (blocking with optional PI).
- *
- * @param m Mutex instance.
- * @param timeout_ticks Wait timeout in ticks (0 = wait forever). Timeouts are best-effort.
- * @return Status.
- */
 rtos_status_t mutex_lock(mutex_t *m, uint32_t timeout_ticks)
 {
     TCB_t *self;
+    rtos_status_t st;
 
     if (m == NULL) {
         return RTOS_ERR_PARAM;
@@ -169,8 +228,6 @@ rtos_status_t mutex_lock(mutex_t *m, uint32_t timeout_ticks)
     if (self == NULL) {
         return RTOS_ERR_STATE;
     }
-
-    (void)timeout_ticks;
 
     for (;;) {
         __asm volatile ("cpsid i" ::: "memory");
@@ -188,29 +245,19 @@ rtos_status_t mutex_lock(mutex_t *m, uint32_t timeout_ticks)
             return RTOS_OK;
         }
 
-        self->state = TASK_STATE_BLOCKED;
         self->blocked_on_mutex = m;
-        scheduler_remove_task(self);
         _wait_enqueue_tail(m, self);
         _apply_pi(m);
 
         __asm volatile ("cpsie i" ::: "memory");
-        scheduler_mark_reschedule();
 
-        while (self->state == TASK_STATE_BLOCKED) {
-            __asm volatile ("nop");
+        st = rtos_block_current(timeout_ticks, BLOCK_MUTEX, m);
+        if (st == RTOS_ERR_TIMEOUT) {
+            return RTOS_ERR_TIMEOUT;
         }
-
-        /* Hand-off may grant ownership before we loop; loop retries acquisition policy. */
     }
 }
 
-/**
- * @brief Unlock mutex held by current task.
- *
- * @param m Mutex instance.
- * @return Status.
- */
 rtos_status_t mutex_unlock(mutex_t *m)
 {
     TCB_t *self;
@@ -238,6 +285,8 @@ rtos_status_t mutex_unlock(mutex_t *m)
         m->owner = next;
         m->locked = true;
         next->blocked_on_mutex = NULL;
+        next->block_reason = BLOCK_NONE;
+        next->block_object = NULL;
         next->state = TASK_STATE_READY;
         (void)scheduler_add_task(next);
     }

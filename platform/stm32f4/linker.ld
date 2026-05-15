@@ -56,6 +56,10 @@ SECTIONS
         _ebss = .;
     } > RAM
 
+    /* Heap limit for newlib (_sbrk); RTOS pool is separate in heap.c */
+    _end = .;
+    PROVIDE(end = .);
+
     /DISCARD/ :
     {
         *(.comment)

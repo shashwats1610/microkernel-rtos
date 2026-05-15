@@ -1,0 +1,9 @@
+flowchart LR
+  SysTick[SysTick_Handler] --> tick[tick wake timers]
+  tick --> slice[time slice check]
+  slice --> pend[PendSV pend]
+  pend --> PendSV[PendSV_Handler]
+  PendSV --> save[save R4-R11 on PSP]
+  save --> sched[scheduler_get_next]
+  sched --> restore[restore R4-R11 PSP]
+  restore --> ret[exception return to task]

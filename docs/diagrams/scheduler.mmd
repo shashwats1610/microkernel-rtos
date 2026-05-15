@@ -1,0 +1,10 @@
+flowchart TB
+  subgraph buckets [8 priority buckets]
+    B0[bucket 0 highest]
+    B7[bucket 7 lowest]
+  end
+  B0 --> R0[circular ready ring]
+  R0 --> TCB1[TCB nodes next_ready]
+  scheduler_get_next --> scan[scan buckets 0 to 7]
+  scan --> pick[take head rotate ring]
+  pick --> run[RUNNING state]

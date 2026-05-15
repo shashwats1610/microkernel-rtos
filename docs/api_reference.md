@@ -1,59 +1,31 @@
 # API reference (overview)
 
-Full declarations live in headers under `include/` and module headers under `src/**`. Generate HTML with `make docs` (Doxygen).
+Headers: `include/` and module headers under `src/**`. HTML: `make docs`.
 
 ## Kernel control (`src/core/task.h`)
 
 | Symbol | Purpose |
 |--------|---------|
-| `task_init()` | Heap + scheduler + idle task creation |
-| `task_create()` | Instantiate a task with stack allocation |
-| `task_delete()` | Tear down a non-running task |
-| `task_delay()` | Block until tick deadline |
-| `task_yield()` | Cooperative reschedule via PendSV |
-| `rtos_start()` | Configure SysTick and launch first thread (`svc`) |
-| `rtos_get_tick()` | Monotonic tick counter |
+| `task_init()` | Heap + scheduler + idle |
+| `task_create()` | New task with heap stack |
+| `task_delete()` | Teardown (detaches wait lists if blocked) |
+| `task_delay()` | Block for ticks |
+| `task_yield()` | Cooperative PendSV |
+| `rtos_start()` | SysTick + first `svc` |
+| `rtos_get_tick()` | Monotonic tick count |
 
-## Scheduler (`src/core/scheduler.h`)
+## Scheduler (internal)
 
-Internal APIs consumed by assembly (`scheduler_get_next`, `scheduler_mark_reschedule`). Applications should use `task_*` wrappers.
+`scheduler_get_next`, `scheduler_rebucket_task`, `scheduler_time_slice_tick` — used by kernel and assembly.
 
-## Mutex (`src/sync/mutex.h`)
+## Mutex / semaphore / message queue
 
-| Symbol | Purpose |
-|--------|---------|
-| `mutex_init()` | Construct mutex |
-| `mutex_lock()` | Acquire (blocking; PI optional via `RTOS_MUTEX_PRIORITY_INHERITANCE`) |
-| `mutex_unlock()` | Release / wake highest waiter |
+Blocking APIs take `timeout_ticks` (`0` = `RTOS_WAIT_FOREVER`). Return `RTOS_ERR_TIMEOUT` on expiry.
 
-## Semaphores (`src/sync/semaphore.h`)
+## Heap / software timers
 
-| Symbol | Purpose |
-|--------|---------|
-| `semaphore_init()` | Counting semaphore |
-| `semaphore_init_binary()` | Binary semaphore |
-| `semaphore_wait()` | Down operation |
-| `semaphore_post()` | Up operation |
+`heap_alloc` / `heap_free`; `sw_timer_start_once` / `sw_timer_start_periodic`.
 
-## Message queues (`src/ipc/msgqueue.h`)
+## Testing
 
-| Symbol | Purpose |
-|--------|---------|
-| `msg_queue_init()` | Bind storage buffer |
-| `msg_queue_send()` | Blocking enqueue |
-| `msg_queue_recv()` | Blocking dequeue |
-
-## Heap (`src/memory/heap.h`)
-
-| Symbol | Purpose |
-|--------|---------|
-| `heap_init()` | Prepare pool |
-| `heap_alloc()` / `heap_free()` | First-fit allocator |
-
-## Software timers (`src/timer/sw_timer.h`)
-
-| Symbol | Purpose |
-|--------|---------|
-| `sw_timer_start_once()` | One-shot |
-| `sw_timer_start_periodic()` | Periodic |
-| `sw_timer_stop()` | Cancel |
+`make test-all` runs `scripts/run_tests.py` (QEMU + GDB pass-flag checks).

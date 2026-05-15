@@ -22,30 +22,15 @@ typedef struct mutex_s {
     struct tcb_s *wait_tail;
 } mutex_t;
 
-/**
- * @brief Initialize mutex object (not locked).
- *
- * @param m Mutex instance.
- * @return Status.
- */
 rtos_status_t mutex_init(mutex_t *m);
-
-/**
- * @brief Lock mutex (blocking with optional PI).
- *
- * @param m Mutex instance.
- * @param timeout_ticks Wait timeout in ticks (0 = wait forever).
- * @return Status.
- */
 rtos_status_t mutex_lock(mutex_t *m, uint32_t timeout_ticks);
-
-/**
- * @brief Unlock mutex held by current task.
- *
- * @param m Mutex instance.
- * @return Status.
- */
 rtos_status_t mutex_unlock(mutex_t *m);
+
+/** @brief Remove waiter on timeout (called from tick wake). */
+void mutex_wake_timeout(struct tcb_s *t);
+
+/** @brief Detach task from mutex wait list (task delete). */
+void mutex_detach_waiter(mutex_t *m, struct tcb_s *t);
 
 #ifdef __cplusplus
 }

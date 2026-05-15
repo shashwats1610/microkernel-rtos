@@ -51,7 +51,7 @@
 /** @brief Enable mutex priority inheritance (recommended). */
 #define RTOS_MUTEX_PRIORITY_INHERITANCE  (1u)
 
-/** @brief Time slice for round-robin within same priority (ticks). */
+/** @brief Time slice for preempting same-bucket peers (SysTick ticks). */
 #define RTOS_TIME_SLICE_TICKS  (1u)
 
 /** @brief Build with relaxed clock for QEMU smoke testing (-DQEMU_BUILD). */

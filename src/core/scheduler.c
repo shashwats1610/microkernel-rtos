@@ -29,9 +29,6 @@ void scheduler_init(void)
 
 /**
  * @brief Add a task to its priority ready ring.
- *
- * @param tcb Task control block (must be valid).
- * @return Status.
  */
 rtos_status_t scheduler_add_task(TCB_t *tcb)
 {
@@ -77,8 +74,6 @@ static void _ring_insert(uint8_t bucket, TCB_t *tcb)
 
 /**
  * @brief Remove a task from the ready ring if present.
- *
- * @param tcb Task control block.
  */
 void scheduler_remove_task(TCB_t *tcb)
 {
@@ -138,9 +133,27 @@ void scheduler_remove_task(TCB_t *tcb)
 }
 
 /**
+ * @brief Move a READY task between priority buckets after priority change.
+ */
+void scheduler_rebucket_task(TCB_t *tcb, uint8_t old_bucket, uint8_t new_bucket)
+{
+    if ((tcb == NULL) || (old_bucket == new_bucket)) {
+        return;
+    }
+
+    if (tcb->state == TASK_STATE_READY) {
+        tcb->prio_bucket = old_bucket;
+        scheduler_remove_task(tcb);
+        tcb->prio_bucket = new_bucket;
+        (void)scheduler_add_task(tcb);
+    }
+    else {
+        tcb->prio_bucket = new_bucket;
+    }
+}
+
+/**
  * @brief Select next task for execution (called from PendSV only).
- *
- * @return Pointer to next TCB (never NULL when idle exists).
  */
 TCB_t *scheduler_get_next(void)
 {
@@ -160,6 +173,7 @@ TCB_t *scheduler_get_next(void)
             sel = ready_head[p];
             ready_head[p] = sel->next_ready;
             sel->state = TASK_STATE_RUNNING;
+            sel->time_slice_counter = 0u;
             current_tcb = sel;
             return sel;
         }
@@ -167,17 +181,17 @@ TCB_t *scheduler_get_next(void)
 
     if (idle_tcb != NULL) {
         idle_tcb->state = TASK_STATE_RUNNING;
+        idle_tcb->time_slice_counter = 0u;
         current_tcb = idle_tcb;
         return idle_tcb;
     }
 
     while (1) {
-        /* No idle configured : halt for diagnosis */
     }
 }
 
 /**
- * @brief Request reschedule if a higher-priority task is ready or RR slice expired.
+ * @brief Request reschedule via PendSV.
  */
 void scheduler_mark_reschedule(void)
 {
@@ -185,4 +199,34 @@ void scheduler_mark_reschedule(void)
 
     icsr = (volatile uint32_t *)0xE000ED04UL;
     *icsr = 0x10000000UL;
+}
+
+/**
+ * @brief Advance time-slice counter; preempt if slice expired and peers exist.
+ */
+void scheduler_time_slice_tick(void)
+{
+    TCB_t *cur;
+    uint8_t bucket;
+    TCB_t *head;
+
+    cur = (TCB_t *)current_tcb;
+    if ((cur == NULL) || (cur == idle_tcb) || (cur->state != TASK_STATE_RUNNING)) {
+        return;
+    }
+
+    cur->time_slice_counter++;
+    if (cur->time_slice_counter < RTOS_TIME_SLICE_TICKS) {
+        return;
+    }
+
+    bucket = cur->prio_bucket;
+    head = ready_head[bucket];
+    if ((head == NULL) || (head->next_ready == head)) {
+        cur->time_slice_counter = 0u;
+        return;
+    }
+
+    cur->time_slice_counter = 0u;
+    scheduler_mark_reschedule();
 }

@@ -1,123 +1,93 @@
-# Microkernel RTOS
+# Cortex-M RTOS
 
-From-scratch preemptive RTOS for ARM Cortex-M, built to demonstrate real kernel internals
-instead of API wrappers. The codebase is interview-ready and intentionally transparent:
-SVC bootstrap, PendSV context switching, priority scheduling, priority inheritance, heap, and
-software timers.
+![CI](https://github.com/shashwats1610/microkernel-rtos/actions/workflows/ci.yml/badge.svg)
+
+Modular kernel sources, **monolithic firmware image** — a from-scratch preemptive RTOS for ARM Cortex-M4,
+built to demonstrate real kernel internals instead of API wrappers. Interview-ready and intentionally
+transparent: SVC bootstrap, PendSV context switching, priority scheduling with time slicing, full mutex
+priority inheritance (including ready-queue migration), blocking timeouts, heap, and software timers.
 
 ## What this project proves
 
-- You can implement Cortex-M exception-driven scheduling (`SVC` first dispatch + `PendSV`
-  context switch path).
-- You can design and explain scheduler invariants (priority buckets + round-robin fairness).
-- You can build and validate practical synchronization primitives (mutex PI, semaphore,
-  message queue).
-- You can reason about embedded safety boundaries (stack canary checks, ISR constraints,
-  static memory map assumptions).
+- Cortex-M exception-driven scheduling (`SVC` first dispatch + `PendSV` context switch).
+- Scheduler invariants: 8 priority buckets, round-robin rings, configurable time slices.
+- Synchronization: mutex with PI, semaphore, message queue — all with tick-based timeouts.
+- Embedded safety boundaries: stack canaries, ISR constraints, static memory map.
 
 ## Architecture at a glance
 
-- **Execution model**: Thread mode tasks run on PSP; handlers run on MSP.
-- **Preemption path**: SysTick updates time/wakeups and pends PendSV, PendSV saves/restores
-  callee registers and switches tasks, SVC performs first task dispatch.
-- **Scheduling policy**: 8 ready buckets (`priority >> 5`) with ring rotation for
-  round-robin inside each bucket.
-- **Platform model**: Linked for STM32F407-class memory layout, with QEMU `netduino2`
-  smoke-run support.
+- **Execution model**: Thread mode on PSP; handlers on MSP.
+- **Preemption**: SysTick → tick, wake, timers, canary, time-slice check → PendSV.
+- **Scheduling**: 8 buckets (`priority >> 5`), circular ready rings, `RTOS_TIME_SLICE_TICKS`.
+- **Platform**: STM32F407-class linker map; QEMU `netduino2` for CI and smoke runs.
 
-See [`docs/architecture.md`](docs/architecture.md) for design rationale and
-[`src/core/context_switch.s`](src/core/context_switch.s) for the assembly switch path.
+See [`docs/architecture.md`](docs/architecture.md) and [`docs/images/`](docs/images/).
 
-## Quick verification (5-10 minutes)
-
-### 1) Build and smoke run
+## Quick verification
 
 ```bash
-make clean
-make all
-make flash
+make clean && make all && make flash
+make APP=mutex_demo && make debug    # GDB :1234 — inspect PI under mutex contention
+make test-all                        # automated firmware tests (QEMU + GDB)
 ```
-
-### 2) Prove scheduler + PI behavior
-
-```bash
-make APP=mutex_demo
-make debug
-```
-
-In GDB, inspect `current_tcb->priority` while high-priority task waits on a mutex held by a
-low-priority task. This demonstrates the priority inheritance path in `src/sync/mutex.c`.
-
-### 3) Prove test target flow
-
-```bash
-make APP=test_scheduler
-make flash
-```
-
-Tests are standalone firmware apps selected by `APP` in the Makefile.
-`make test` builds `APP=test_scheduler` and launches QEMU.
 
 ## Module map
 
-- `include/` - public kernel API and configuration (`rtos.h`, `rtos_types.h`,
-  `rtos_config.h`).
-- `src/core/` - task lifecycle, scheduler implementation, context switch assembly.
-- `src/sync/` - mutex (with PI) and semaphore implementations.
-- `src/ipc/` - fixed-size message queue implementation.
-- `src/memory/` - static pool first-fit allocator with coalescing.
-- `src/timer/` - software timer list and tick integration.
-- `src/platform/` - SysTick/system glue and syscall stubs.
-- `platform/stm32f4/` - startup and linker script for memory layout.
-- `examples/` - behavior demos (`blinky`, `mutex_demo`, `stress_test`).
-- `tests/` - firmware test entrypoints (`test_scheduler`, `test_mutex`,
-  `test_priority_inheritance`, `test_msgqueue`).
+| Path | Role |
+|------|------|
+| `include/` | Public API (`rtos.h`, `rtos_config.h`, `rtos_types.h`) |
+| `src/core/` | Tasks, scheduler, context switch, blocking |
+| `src/sync/` | Mutex (PI), semaphore |
+| `src/ipc/` | Message queue |
+| `src/memory/` | Static-pool first-fit heap |
+| `src/timer/` | Software timers |
+| `src/platform/` | SysTick, NVIC, syscalls |
+| `platform/stm32f4/` | Startup + linker |
+| `examples/` | `sched_demo`, `mutex_demo`, `stress_test` |
+| `tests/` | Firmware integration tests |
+| `scripts/run_tests.py` | CI/local test runner |
 
-## Build and run workflow
-
-- Build profile:
-  - `make` (debug, `-O0 -g3`)
-  - `make BUILD=release` (`-O2 -g`)
-- App/test selection:
-  - `make APP=blinky`
-  - `make APP=mutex_demo`
-  - `make APP=stress_test`
-  - `make APP=test_scheduler`
-- Run/debug:
-  - `make flash` for QEMU smoke run
-  - `make debug` for QEMU with GDB stub on `:1234`
-
-## Engineering decisions and tradeoffs
-
-- **Scheduler structure**: Ready rings keep per-bucket operations simple and deterministic.
-- **PI scope**: Mutex PI boosts owner priority fields; this portfolio version does not migrate
-  owner node between ready buckets.
-- **Timeout support**: Timeout parameters exist in blocking APIs, but full wake-by-timeout
-  coverage is intentionally limited in this phase.
-- **Stack safety**: Canary checks run from SysTick and trap with debug globals for root-cause.
-
-## Known limitations
-
-- QEMU `netduino2` is an approximation for STM32F407 behavior; use Renode/hardware for tighter
-  platform fidelity.
-- Cycle-accurate timing claims must be measured on silicon (for example with DWT CYCCNT), not
-  QEMU wall-clock timing.
-- This is a learning/portfolio kernel and not a safety-certified RTOS replacement.
-
-## Deep-dive docs
-
-- [`docs/architecture.md`](docs/architecture.md) - execution model, memory map, and scheduler.
-- [`docs/api_reference.md`](docs/api_reference.md) - API-oriented module documentation.
-- [`docs/diagrams/README.md`](docs/diagrams/README.md) - diagram checklist for walkthroughs.
-- [`ENGINEERING_RETROSPECTIVE.txt`](ENGINEERING_RETROSPECTIVE.txt) - engineering lessons,
-  tradeoffs, and improvements.
-
-Generate API docs with:
+## Build
 
 ```bash
+make                              # debug, QEMU (default)
+make BUILD=release
+make TARGET=hw BUILD=release      # hardware ELF (no QEMU_BUILD)
+make APP=sched_demo|mutex_demo|stress_test|test_*
+make flash / make debug           # QEMU
+make flash-hw / make debug-hw     # ST-Link / OpenOCD (tools not bundled)
+make test-all
 make docs
 ```
 
+## Features (implemented)
+
+- Preemptive 8-bucket scheduler with round-robin and time slicing
+- `task_delay`, `task_yield`, `task_delete` (with wait-list detach)
+- Mutex priority inheritance with ready-bucket migration
+- Semaphore, message queue, software timers
+- Blocking API timeouts (`RTOS_ERR_TIMEOUT`)
+- Stack canaries checked from SysTick
+- Semihosting `printf` under QEMU; USART2 stub for `TARGET=hw`
+
+## Out of scope
+
+- Multi-architecture ports, MPU/process isolation, full STM32 HAL
+- Safety certification (DO-178C / IEC 62304)
+- Renode / cycle-accurate benchmarks (use silicon + DWT if needed)
+
+## Known limitations
+
+- QEMU `netduino2` approximates STM32F407; validate timing on hardware.
+- Not a certified RTOS replacement.
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/api_reference.md`](docs/api_reference.md)
+- [`docs/diagrams/README.md`](docs/diagrams/README.md)
+- [`ENGINEERING_RETROSPECTIVE.txt`](ENGINEERING_RETROSPECTIVE.txt)
+
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).

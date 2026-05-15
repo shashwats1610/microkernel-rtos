@@ -14,6 +14,18 @@
 struct tcb_s;
 
 /**
+ * @brief Why a task is blocked (used for timeout wake and delete cleanup).
+ */
+typedef enum {
+    BLOCK_NONE = 0,
+    BLOCK_DELAY,
+    BLOCK_MUTEX,
+    BLOCK_SEMAPHORE,
+    BLOCK_MSG_SEND,
+    BLOCK_MSG_RECV
+} block_reason_t;
+
+/**
  * @brief Task scheduling state.
  */
 typedef enum {
@@ -60,6 +72,10 @@ typedef struct tcb_s {
     void (*task_func)(void);
     struct tcb_s *next_ready;
     uint32_t time_slice_counter;
+
+    block_reason_t block_reason;
+    void *block_object;
+    rtos_status_t block_wake_status;
 } TCB_t;
 
 #endif /* RTOS_TYPES_H */

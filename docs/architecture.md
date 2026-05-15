@@ -2,34 +2,45 @@
 
 ## Execution environment
 
-- **Privileged handler mode** uses **MSP** for exception stacks (including PendSV/SVC prologue stacks).
-- **Thread mode tasks** use **PSP**. The first thread entry uses **SVC** with an exception return that unstacks the synthetic frame prepared in `task_create()`.
-- **SysTick** drives a 1 ms tick (`RTOS_TICK_RATE_HZ`), increments global time, wakes delayed tasks, advances software timers, checks stack canaries, then requests **PendSV** for preemption.
+- **Privileged handler mode** uses **MSP** for exception stacks.
+- **Thread mode tasks** use **PSP**. First entry uses **SVC** with synthetic frame from `task_create()`.
+- **SysTick** drives 1 ms ticks: wake delayed/blocked tasks, software timers, stack canaries, time-slice check, then **PendSV**.
 
 ## Memory map (STM32F407-class link)
 
 | Region | Address | Size | Notes |
 |--------|---------|------|-------|
 | Flash | `0x08000000` | 1 MiB | `.text`, `.rodata` |
-| SRAM | `0x20000000` | 128 KiB | `.data`, `.bss`, stacks, RTOS heap pool |
+| SRAM | `0x20000000` | 128 KiB | `.data`, `.bss`, stacks, heap |
 
-CCM SRAM (`0x10000000`) is **not modeled** here to keep the Phase-1 linker narrative simple.
+CCM SRAM (`0x10000000`) is not modeled in the linker script.
 
 ## Scheduler
 
-Eight ready rings indexed by `prio_bucket = priority >> 5` (clamped). Each ring is **circular** via `TCB::next_ready`.
+Eight ready rings: `prio_bucket = priority >> 5`. Each ring is circular via `TCB::next_ready`.
 
-`scheduler_get_next()` selects the lowest-index nonempty bucket, takes the head task as the next runnable, and **rotates** the ring pointer so round-robin progresses fairly within the bucket.
+`scheduler_get_next()` scans buckets 0..7, takes head, rotates ring for round-robin.
+
+**Time slicing**: `scheduler_time_slice_tick()` runs from SysTick; when `time_slice_counter >= RTOS_TIME_SLICE_TICKS` and another task exists in the same bucket, PendSV is pended.
+
+**Priority inheritance**: `mutex.c` boosts owner `priority` and calls `scheduler_rebucket_task()` when the bucket changes while the owner is READY.
 
 ## Context switch
 
-`PendSV_Handler` (see `src/core/context_switch.s`) saves **R4–R11** to the current PSP stack, stores PSP into `current_tcb->stack_ptr`, invokes `scheduler_get_next()`, then restores **R4–R11** for the successor task and updates PSP to point at the hardware exception frame.
+`PendSV_Handler` saves **R4–R11** on PSP, stores PSP in `current_tcb->stack_ptr`, calls `scheduler_get_next()`, restores successor registers and PSP.
+
+## Blocking and timeouts
+
+`rtos_block_current()` sets `wake_time` and `block_reason`. `rtos_wake_delayed()` dispatches:
+
+- `BLOCK_DELAY` → ready queue
+- `BLOCK_MUTEX` / `BLOCK_SEMAPHORE` / `BLOCK_MSG_*` → module timeout wake (wait list unlink, `RTOS_ERR_TIMEOUT`)
 
 ## Stack integrity
 
-Each task stack reserves a **canary word** `0xDEADBEEF` at the lowest allocated address (`stack_base`). `SysTick_Handler` walks registered tasks and traps if corrupted.
+Canary `0xDEADBEEF` at `stack_base`; `rtos_stack_check_all()` from SysTick traps with debug globals on corruption.
 
-## Known simplifications
+## Platform
 
-- NVIC priority programming is stubbed in `nvic_set_priority()` for portability.
-- Mutex priority inheritance adjusts numeric priority fields but does **not** physically reorder ready-queue placement when inheritance boosts an owner (acceptable for the demonstration scope; production kernels would migrate the owner TCB between buckets).
+- **QEMU** (`TARGET=qemu`): 16 MHz, semihosting `_write`.
+- **Hardware** (`TARGET=hw`): PLL bring-up in `SystemInitClock()`, USART2 polling TX stub.

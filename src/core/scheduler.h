@@ -35,6 +35,15 @@ rtos_status_t scheduler_add_task(TCB_t *tcb);
 void scheduler_remove_task(TCB_t *tcb);
 
 /**
+ * @brief Move a READY task between priority buckets after priority change.
+ *
+ * @param tcb Task control block.
+ * @param old_bucket Previous bucket index.
+ * @param new_bucket New bucket index (already stored in @a tcb unless not READY).
+ */
+void scheduler_rebucket_task(TCB_t *tcb, uint8_t old_bucket, uint8_t new_bucket);
+
+/**
  * @brief Select next task for execution (called from PendSV only).
  *
  * @return Pointer to next TCB (never NULL when idle exists).
@@ -42,9 +51,14 @@ void scheduler_remove_task(TCB_t *tcb);
 TCB_t *scheduler_get_next(void);
 
 /**
- * @brief Request reschedule if a higher-priority task is ready or RR slice expired.
+ * @brief Request reschedule via PendSV.
  */
 void scheduler_mark_reschedule(void);
+
+/**
+ * @brief Advance time-slice counter; preempt if slice expired and peers exist.
+ */
+void scheduler_time_slice_tick(void);
 
 /**
  * @brief Globally runnable pointer used by PendSV (written only from kernel).

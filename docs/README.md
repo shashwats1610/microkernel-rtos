@@ -1,5 +1,6 @@
 # Documentation
 
-- `architecture.md` — Memory map, scheduler, context switch, assumptions.
-- `api_reference.md` — Quick API map into headers.
-- `diagrams/` — Draw.io sources (placeholders described in `diagrams/README.md`).
+- [`architecture.md`](architecture.md) — Memory map, scheduler, context switch, timeouts, PI.
+- [`api_reference.md`](api_reference.md) — API map into headers.
+- [`diagrams/`](diagrams/) — Mermaid sources and diagram guide.
+- [`images/`](images/) — SVG architecture figures.
