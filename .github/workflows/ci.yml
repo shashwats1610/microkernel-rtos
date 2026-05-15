@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi qemu-system-arm
+          python3 -m pip install --upgrade pip
+          pip install -r tools/requirements.txt
+
+      - name: Install hdiffi (HPatchLite)
+        run: |
+          git clone --depth 1 --recursive https://github.com/sisong/HPatchLite.git /tmp/HPatchLite
+          make -C /tmp/HPatchLite hdiffi
+          echo "/tmp/HPatchLite" >> "$GITHUB_PATH"
+
+      - name: Preflight
+        run: make preflight
+
+      - name: Build
+        run: make keys all
+
+      - name: Bootloader size check
+        run: |
+          SZ=$(stat -c%s build/bootloader/bootloader.bin)
+          echo "bootloader.bin: ${SZ} bytes"
+          test "$SZ" -le 65536
+
+      - name: Tests (strict)
+        run: make test STRICT=1
+
+      - name: Upload bootloader artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootloader-bin
+          path: build/bootloader/bootloader.bin

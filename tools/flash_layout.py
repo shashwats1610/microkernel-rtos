@@ -46,7 +46,7 @@ SLOT_B_ID = ord("B")
 CONFIG_BODY_FMT = "<II BBBB IIO"  # placeholder; real packing below
 
 
-def make_default_config(active: int = SLOT_A_ID) -> bytes:
+def make_default_config(active: int = SLOT_A_ID, boot_attempts: int = 0) -> bytes:
     """Pack a default BootConfig_t exactly per bootloader/include/config.h.
 
     Layout (24 bytes):
@@ -65,7 +65,7 @@ def make_default_config(active: int = SLOT_A_ID) -> bytes:
         0,                  # slot_a_version
         0,                  # slot_b_version
         active & 0xFF,      # active_slot
-        0,                  # boot_attempts
+        boot_attempts & 0xFF,
         0,                  # rollback_counter
         0,                  # _reserved
         0,                  # last_good_boot
@@ -101,7 +101,10 @@ def build(args: argparse.Namespace) -> bytes:
 
     # Boot config.
     if not args.no_config:
-        cfg = make_default_config(SLOT_A_ID if args.active == "A" else SLOT_B_ID)
+        cfg = make_default_config(
+            SLOT_A_ID if args.active == "A" else SLOT_B_ID,
+            boot_attempts=args.boot_attempts,
+        )
         out[CONFIG_OFF : CONFIG_OFF + len(cfg)] = cfg
 
     # Slot A.
@@ -149,6 +152,12 @@ def main() -> None:
                         dest="slot_b", help="Signed image for Slot B")
     parser.add_argument("--out", type=Path, default=Path("build/flash.bin"))
     parser.add_argument("--active", choices=["A", "B"], default="A")
+    parser.add_argument(
+        "--boot-attempts",
+        type=int,
+        default=0,
+        help="Initial boot_attempts in BootConfig (for rollback tests)",
+    )
     parser.add_argument("--no-config", action="store_true",
                         help="Leave config region as 0xFF; runtime defaults")
     parser.add_argument("--corrupt", default=None,

@@ -50,6 +50,39 @@ bool boot_config_load(BootConfig_t *out)
     return false;
 }
 
+uint32_t boot_config_antidowngrade_floor(const BootConfig_t *cfg)
+{
+    uint32_t floor = (uint32_t)cfg->rollback_counter << 16;
+    if (cfg->slot_a_version > floor) {
+        floor = cfg->slot_a_version;
+    }
+    if (cfg->slot_b_version > floor) {
+        floor = cfg->slot_b_version;
+    }
+    return floor;
+}
+
+bool boot_config_firmware_allowed(const BootConfig_t *cfg, uint32_t fw_version)
+{
+    return fw_version >= boot_config_antidowngrade_floor(cfg);
+}
+
+void boot_config_record_ota_to_slot(BootConfig_t *cfg,
+                                    uint8_t slot,
+                                    uint32_t fw_version)
+{
+    const uint32_t floor = boot_config_antidowngrade_floor(cfg);
+    if (slot == SLOT_A) {
+        cfg->slot_a_version = fw_version;
+    } else {
+        cfg->slot_b_version = fw_version;
+    }
+    if (fw_version > floor) {
+        const uint8_t major = (uint8_t)((fw_version >> 16) & 0xFFU);
+        cfg->rollback_counter = (major != 0U) ? major : 1U;
+    }
+}
+
 bool boot_config_save(const BootConfig_t *cfg)
 {
     /* Defensive copy: stamp the CRC ourselves so callers can't pass a

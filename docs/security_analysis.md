@@ -59,12 +59,11 @@ at build time).
    arbitrary firmware. Mitigations a real product would add:
    - hardware-backed key storage (HSM / cloud KMS) for the signing
      operation,
-   - an on-device anti-rollback counter (we have a field for it -
-     `BootConfig_t.rollback_counter` - but the current code does not
-     enforce it; enforcement would reject any image whose
-     `version` is less than the current rollback counter, so an
-     attacker cannot push a downgrade containing a known
-     vulnerability),
+   - an on-device anti-rollback counter (`BootConfig_t.rollback_counter`
+     plus per-slot version fields) — **enforced in this build** via
+     `boot_config_firmware_allowed()` before OTA commit and updated
+     after a successful swap; rejects signed images below the recorded
+     version floor,
    - a public-key revocation mechanism (multi-key configuration where
      the bootloader can be told via OTA "from now on, accept these N
      new keys; reject the old one").

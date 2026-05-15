@@ -127,10 +127,10 @@ def run_one_iteration(iteration: int) -> bool:
 def main() -> int:
     if not have_qemu():
         print("SKIP: qemu-system-arm not on PATH; skipping power-loss test")
-        return 0
+        return 2
     if not FLASH_BIN.exists() or not APP_SIGNED.exists():
         print(f"SKIP: {FLASH_BIN} or {APP_SIGNED} missing; run 'make all' first")
-        return 0
+        return 2
 
     random.seed(42)  # reproducible
     failures = 0

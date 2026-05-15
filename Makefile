@@ -60,7 +60,13 @@ WARN := -Wall -Wextra -Werror \
 CFLAGS_COMMON := $(WARN) -ffunction-sections -fdata-sections \
                  -O2 -g3 -std=c11 -fno-common -fstack-usage
 
-INCLUDES_BL := -Ibootloader/include -Icommon -Ithird_party/micro-ecc
+INCLUDES_BL := -Ibootloader/include -Icommon -Ithird_party/micro-ecc \
+               -Ithird_party/hpatch_lite -Ithird_party/tinyuz
+
+# HPatchLite + optional tinyuz (hpi_compressType_tuz) for compressed delta OTA.
+BL_EXTRA_CFLAGS := -D_IS_RUN_MEM_SAFE_CHECK=0 -Dtuz_kMaxOfDictSize=8192
+TUZ_CFLAGS := -D_IS_USED_SHARE_hpatch_lite_types=1 -D_IS_RUN_MEM_SAFE_CHECK=0 \
+              -Ithird_party/hpatch_lite
 
 # micro-ecc configuration: SECP256R1 only, generic-C platform (compiles
 # everywhere; the small speed loss versus the ARM-thumb asm path is well
@@ -86,13 +92,16 @@ BL_SRCS_C := \
   bootloader/src/boot_config.c \
   bootloader/src/flash_driver.c \
   bootloader/src/crypto.c \
+  bootloader/src/delta_patch.c \
   bootloader/src/ota_client.c \
   bootloader/src/recovery.c \
   bootloader/src/crc32.c \
   bootloader/src/sha256.c \
   bootloader/src/uart.c \
   bootloader/src/iwdg.c \
-  third_party/micro-ecc/uECC.c
+  third_party/micro-ecc/uECC.c \
+  third_party/hpatch_lite/hpatch_lite.c \
+  third_party/tinyuz/tuz_dec.c
 
 BL_SRCS_S := bootloader/startup.s
 
@@ -122,7 +131,8 @@ APP_ELF      := $(A_DIR)/app.elf
 APP_BIN      := $(A_DIR)/app.bin
 
 # --- VPATH so wildcard %.o rules can find sources by basename -------------
-vpath %.c bootloader/src application/src third_party/micro-ecc
+vpath %.c bootloader/src application/src third_party/micro-ecc \
+  third_party/hpatch_lite third_party/tinyuz
 vpath %.s bootloader application
 
 # =====================================================================
@@ -139,7 +149,8 @@ all: keys $(BL_BIN) $(APP_BIN) image sign flash_image
 .PHONY: preflight
 preflight:
 	@$(PYTHON) -c "import shutil, sys; \
-[print(t, '->', shutil.which(t) or 'MISSING') for t in ['arm-none-eabi-gcc','qemu-system-arm',sys.executable,'make']]; \
+tools=('arm-none-eabi-gcc','qemu-system-arm',sys.executable,'make','hdiffi'); \
+[print(t, '->', shutil.which(t) or 'MISSING') for t in tools]; \
 sys.exit(0 if shutil.which('arm-none-eabi-gcc') else 1)"
 
 # =====================================================================
@@ -165,7 +176,10 @@ $(B_DIR):
 
 $(B_DIR)/%.o: %.c | $(B_DIR) $(PUBKEY_H)
 	$(CC) $(PROFILE_CFLAGS) $(CFLAGS_COMMON) $(INCLUDES_BL) $(UECC_DEFINES) \
-	      -c -o $@ $<
+	      $(BL_EXTRA_CFLAGS) -c -o $@ $<
+$(B_DIR)/tuz_dec.o: third_party/tinyuz/tuz_dec.c | $(B_DIR) $(PUBKEY_H)
+	$(CC) $(PROFILE_CFLAGS) $(CFLAGS_COMMON) $(INCLUDES_BL) $(TUZ_CFLAGS) \
+	      -Wno-unused-variable -c -o $@ $<
 
 $(B_DIR)/%.o: %.s | $(B_DIR)
 	$(AS) $(PROFILE_CFLAGS) -c -o $@ $<
@@ -179,6 +193,9 @@ $(BL_ELF): $(BL_OBJS) $(BL_LDSCRIPT)
 
 $(BL_BIN): $(BL_ELF)
 	$(OBJCOPY) -O binary $< $@
+	@$(PYTHON) -c "import os,sys; n=os.path.getsize(sys.argv[1]); \
+print(f'bootloader.bin: {n} B ({n/1024:.1f} KiB)'); \
+sys.exit(1 if n>65536 else 0)" $@
 
 .PHONY: bootloader
 bootloader: $(BL_BIN)
@@ -213,12 +230,42 @@ $(APP_BIN): $(APP_ELF)
 .PHONY: app
 app: $(APP_BIN)
 
+# Signed image outputs (must be defined before app_rollback / delta rules).
+APP_UNSIGNED := $(BUILD_DIR)/app_unsigned.bin
+APP_SIGNED   := $(BUILD_DIR)/app_signed.bin
+APP_ROLLBACK_SIGNED := $(BUILD_DIR)/app_rollback_signed.bin
+APP_V1_SIGNED := $(BUILD_DIR)/app_v1_signed.bin
+APP_V2_SIGNED := $(BUILD_DIR)/app_v2_signed.bin
+DELTA_PATCH  := $(BUILD_DIR)/app_v1_to_v2.patch
+
+.PHONY: app_rollback
+app_rollback: $(APP_ROLLBACK_SIGNED)
+
+$(BUILD_DIR)/app_rollback_unsigned.bin: $(A_DIR)/app_rollback.bin
+	$(PYTHON) tools/create_image.py $< $@ --version $(APP_VERSION)
+
+$(APP_ROLLBACK_SIGNED): $(BUILD_DIR)/app_rollback_unsigned.bin $(KEYS_PRIV)
+	$(PYTHON) tools/sign_firmware.py $< $@
+
+$(A_DIR)/app_rollback.bin: $(A_DIR)/app_rollback.elf
+	$(OBJCOPY) -O binary $< $@
+
+$(A_DIR)/app_rollback.elf: $(A_DIR)/app_rollback_main.o $(A_DIR)/system_app.o \
+	$(A_DIR)/uart.o $(A_DIR)/iwdg.o $(A_DIR)/startup_app.o $(APP_LDSCRIPT)
+	$(CC) $(PROFILE_CFLAGS) $(CFLAGS_COMMON) -T $(APP_LDSCRIPT) \
+	      $(LDFLAGS_COMMON) -Wl,-Map=$(A_DIR)/app_rollback.map \
+	      -o $@ $(A_DIR)/app_rollback_main.o $(A_DIR)/system_app.o \
+	      $(A_DIR)/uart.o $(A_DIR)/iwdg.o $(A_DIR)/startup_app.o
+
+$(A_DIR)/app_rollback_main.o: tests/test_rollback.c | $(A_DIR)
+	$(CC) $(PROFILE_CFLAGS) $(CFLAGS_COMMON) \
+	      -Iapplication/include -Ibootloader/include -Icommon \
+	      -DAPP_VERSION_STR=\"$(APP_VERSION)\" \
+	      -c -o $@ $<
+
 # =====================================================================
 # Sign and image
 # =====================================================================
-APP_UNSIGNED := $(BUILD_DIR)/app_unsigned.bin
-APP_SIGNED   := $(BUILD_DIR)/app_signed.bin
-
 .PHONY: image
 image: $(APP_UNSIGNED)
 
@@ -283,9 +330,23 @@ $(RENODE_SCRIPT) $(BL_ELF) $(APP_SIGNED)
 # =====================================================================
 # Tests
 # =====================================================================
+.PHONY: delta
+delta: $(DELTA_PATCH)
+
+$(APP_V1_SIGNED): $(KEYS_PRIV)
+	@$(MAKE) APP_VERSION=1.0.0 image sign
+	@$(PYTHON) -c "import shutil; shutil.copy2('$(APP_SIGNED)', '$(APP_V1_SIGNED)')"
+
+$(APP_V2_SIGNED): $(KEYS_PRIV)
+	@$(MAKE) APP_VERSION=1.1.0 image sign
+	@$(PYTHON) -c "import shutil; shutil.copy2('$(APP_SIGNED)', '$(APP_V2_SIGNED)')"
+
+$(DELTA_PATCH): $(APP_V1_SIGNED) $(APP_V2_SIGNED)
+	$(PYTHON) tools/make_delta.py $(APP_V1_SIGNED) $(APP_V2_SIGNED) $@
+
 .PHONY: test
 test:
-	$(PYTHON) tests/run_all.py
+	$(PYTHON) tests/run_all.py $(if $(STRICT),--strict,)
 
 # =====================================================================
 # Cleanup

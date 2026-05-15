@@ -81,4 +81,19 @@ void boot_config_stamp_crc(BootConfig_t *cfg);
  */
 bool boot_config_save(const BootConfig_t *cfg);
 
+/**
+ * @brief Minimum firmware version allowed (anti-downgrade floor).
+ *
+ * Uses slot version records and @p rollback_counter (major semver byte).
+ */
+uint32_t boot_config_antidowngrade_floor(const BootConfig_t *cfg);
+
+/** @return true if @p fw_version may be installed. */
+bool boot_config_firmware_allowed(const BootConfig_t *cfg, uint32_t fw_version);
+
+/** Record a verified image in @p slot and raise the anti-downgrade floor. */
+void boot_config_record_ota_to_slot(BootConfig_t *cfg,
+                                    uint8_t slot,
+                                    uint32_t fw_version);
+
 #endif /* BOOTLOADER_CONFIG_H */

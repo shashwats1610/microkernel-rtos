@@ -158,10 +158,10 @@ def push_to_recovery() -> int:
 def main() -> int:
     if not have_qemu():
         print("SKIP: qemu-system-arm not on PATH")
-        return 0
+        return 2
     if not APP_SIGNED.exists() or not BL_BIN.exists():
         print("SKIP: build artefacts missing; run 'make all' first")
-        return 0
+        return 2
     build_corrupt_flash()
     return push_to_recovery()
 

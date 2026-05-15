@@ -11,16 +11,20 @@
  *   except the trailing CRC field). Standard IEEE 802.3 polynomial.
  *
  * Opcodes:
- *   OP_START (0x21): begin a transfer to the inactive slot. DATA carries
- *                    a 4-byte little-endian total_size (the signed image
- *                    length). The receiver erases the inactive slot and
- *                    sets up streaming write state.
+ *   OP_START (0x21): begin a full-image transfer to the inactive slot.
+ *                    DATA carries a 4-byte little-endian total_size (the
+ *                    signed image length). The receiver erases the inactive
+ *                    region and sets up streaming write state.
+ *   OP_START_DELTA (0x24): begin a differential transfer. DATA is 40 bytes:
+ *                    patch_total (u32 LE), expected_new_total (u32 LE),
+ *                    base_sha256 (32 bytes) of the active-slot image bytes
+ *                    (header + payload per FirmwareHeader_t.image_size).
+ *                    Patch bytes are written to the tail of the inactive slot;
+ *                    END applies HPatchLite then crypto_verify_firmware().
  *   OP_DATA  (0x22): a chunk to be appended at the current write offset.
  *                    SEQ must equal the previously ack'd SEQ + 1.
- *   OP_END   (0x23): no DATA. The receiver runs crypto_verify_firmware()
- *                    on the freshly-written slot, sets the OTA-pending
- *                    flag in SharedBootBlock, and reboots into the
- *                    bootloader (which will commit the swap).
+ *   OP_END   (0x23): no DATA. The receiver verifies (and for delta, applies
+ *                    the patch first), sets OTA-pending, and reboots.
  *   OP_ABORT (0x2F): no DATA. Cancels any in-progress transfer.
  *
  * Sequence numbering is 16-bit, wraps at 0xFFFF, starts at 1 for the first
@@ -40,6 +44,7 @@
 #define OTA_OP_START        0x21U
 #define OTA_OP_DATA         0x22U
 #define OTA_OP_END          0x23U
+#define OTA_OP_START_DELTA  0x24U
 #define OTA_OP_ABORT        0x2FU
 
 #define OTA_MAX_PAYLOAD     1024U

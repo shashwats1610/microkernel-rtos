@@ -154,6 +154,13 @@ If the application crashes before calling `bootloader_confirm_boot()`, the
 flag stays at 0 and the bootloader treats it as a failed boot on the next
 power-on. Three consecutive failed boots trigger a slot switch.
 
+## Delta OTA (HPatchLite)
+
+Differential updates use opcode **`START_DELTA`**: the patch blob is written to the **tail**
+of the inactive slot (`expected_new_total + patch_total <= SLOT_SIZE`), then HPatchLite
+reconstructs the signed image at the slot base before the usual ECDSA verification.
+See [`docs/update_protocol.md`](update_protocol.md) and [`bootloader/src/delta_patch.c`](../bootloader/src/delta_patch.c).
+
 ## Memory layout — config storage caveat (real hardware)
 
 On real STM32F407, sector 4 (`0x08010000`–`0x0801FFFF`) is a single 64 KB

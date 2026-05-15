@@ -11,7 +11,7 @@
  *   - Trigger a hard fault by dereferencing 0xDEAD0000 - this guarantees
  *     the bootloader will not see the confirmation flag on the next boot.
  *
- * The test orchestrator (tests/test_rollback.py, future work) launches
+ * The test orchestrator (tests/test_rollback.py) launches
  * QEMU with this image in Slot A; after 3 boot cycles the bootloader
  * should switch to Slot B and run the good demo app from v1.0.0.
  */

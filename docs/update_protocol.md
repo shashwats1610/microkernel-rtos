@@ -1,5 +1,8 @@
 # OTA Update Protocol
 
+**Protocol revision:** v2 — adds `START_DELTA` (0x24) for HPatchLite differential
+updates alongside full-image `START` (0x21). v1-only hosts keep using `START` only.
+
 The bootloader's OTA receiver speaks a small framed protocol over the OTA
 UART (USART2). In the QEMU build that UART is bridged to TCP port 4444 via
 `-serial tcp:127.0.0.1:4444,server,nowait`; on real hardware it's a normal
@@ -24,25 +27,39 @@ before the trailing CRC), IEEE 802.3 polynomial.
 
 ## Opcodes
 
-| OP   | Name      | DATA contents                           |
-| ---- | --------- | --------------------------------------- |
-| 0x21 | `START`   | `total_size` (u32 LE) of the signed image |
-| 0x22 | `DATA`    | a chunk of bytes appended at the running offset |
-| 0x23 | `END`     | empty                                   |
-| 0x2F | `ABORT`   | empty                                   |
+| OP   | Name            | DATA contents |
+| ---- | --------------- | ------------- |
+| 0x21 | `START`         | `total_size` (u32 LE) of the full signed image |
+| 0x24 | `START_DELTA`   | 40 bytes: `patch_total` (u32 LE), `expected_new_total` (u32 LE), `base_sha256` (32 bytes). See below. |
+| 0x22 | `DATA`          | chunk appended at the running write offset (full image or patch tail) |
+| 0x23 | `END`           | empty |
+| 0x2F | `ABORT`         | empty |
+
+### `START_DELTA` semantics
+
+- **`patch_total`**: Byte length of the HPatchLite patch stream carried by subsequent `DATA` frames.
+- **`expected_new_total`**: Byte length of the **reconstructed** signed firmware image (`FirmwareHeader_t` + payload) after applying the patch; must match the `newSize` field in the patch header and `crypto_verify_firmware()` on the inactive slot.
+- **`base_sha256`**: SHA-256 of the **on-device** old image bytes: the first `sizeof(FirmwareHeader_t) + image_size` bytes of the **currently active** slot (same layout as on flash, including the populated signature field). The host computes this from the signed baseline image file via [`tools/delta_common.py`](../tools/delta_common.py).
+
+**Inactive slot layout during delta:** The inactive slot is erased. Patch bytes are written to the **tail** — `[slot_base + SLOT_SIZE - patch_total, slot_base + SLOT_SIZE)` — so they do not overlap the reconstructed image written from `slot_base` upward during patch apply. Constraint enforced by the bootloader: `expected_new_total + patch_total <= SLOT_SIZE`.
+
+The bootloader applies **`delta_apply_patch()`** (HPatchLite with **`hpi_compressType_no`** or **`hpi_compressType_tuz`** via vendored tinyuz), then runs the same **`crypto_verify_firmware()`** as full OTA. Patches are produced with [`tools/make_delta.py`](../tools/make_delta.py) (requires `hdiffi` on `PATH`; use `--compress tuz` for compressed patches).
 
 ## State machine (receiver)
 
-1. Wait for `START`.
-   - On START: pick the inactive slot from `BootConfig.active_slot`,
-     erase it, record `total_size` and reset `written = 0`. ACK.
-2. Repeatedly accept `DATA` frames whose SEQ is the previously ACK'd
-   SEQ + 1. Each frame is programmed to `slot_addr + written`. ACK.
-3. On `END`, run `crypto_verify_firmware()` on the inactive slot; if it
-   passes, set `SHARED_BOOT_BLOCK.ota_pending = 1`, ACK, and call
-   `NVIC_SystemReset()`.
-4. On any CRC mismatch, sequence error, or flash error, NAK; the host
-   retransmits the same SEQ.
+**Full image (`START`)**
+
+1. On `START`: pick the inactive slot, erase the range `[slot_addr, slot_addr + total_size)`, set `written = 0`. ACK.
+2. `DATA` frames program `slot_addr + written`. ACK.
+3. On `END`, `crypto_verify_firmware(inactive)`; on success, set `ota_pending` and reset.
+
+**Delta (`START_DELTA`)**
+
+1. On `START_DELTA`: verify `base_sha256` against the active slot; pick inactive slot; erase the **entire** inactive slot; set `patch_tail = slot_addr + SLOT_SIZE - patch_total`, `written = 0`. ACK.
+2. `DATA` frames program `patch_tail + written` (patch bytes only). ACK.
+3. On `END`, run HPatchLite apply (old = active slot, diff = tail of inactive, new = from `slot_addr`), then `crypto_verify_firmware(inactive)`; on success, set `ota_pending` and reset.
+
+**Common:** On any CRC mismatch, sequence error, or flash error, NAK; the host retransmits the same SEQ.
 
 ## Sequence diagram (happy path, QEMU TCP transport)
 

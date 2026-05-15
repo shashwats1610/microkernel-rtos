@@ -151,6 +151,11 @@ flash_status_t flash_init(void)
 flash_status_t flash_unlock(void)      { return FLASH_OK; }
 flash_status_t flash_lock(void)        { return FLASH_OK; }
 
+uint32_t flash_ota_slot_span(void)
+{
+    return SHADOW_SLOT_SIZE;
+}
+
 flash_status_t flash_erase_sector(uint32_t sector_start_addr)
 {
     int idx = sector_index_for_addr(sector_start_addr);
@@ -284,6 +289,11 @@ static flash_status_t wait_busy(void)
     return FLASH_ERR_BUSY;
 }
 
+uint32_t flash_ota_slot_span(void)
+{
+    return SLOT_SIZE;
+}
+
 flash_status_t flash_init(void)
 {
     /* Clear any leftover error flags; harmless if none are set. */
@@ -383,7 +393,9 @@ flash_status_t flash_program_bytes(uint32_t addr,
     flash_status_t s;
 
     s = flash_unlock();
-    if (s != FLASH_OK) return s;
+    if (s != FLASH_OK) {
+        return s;
+    }
 
     /* Word phase. */
     for (; i + 4U <= size && (((addr + i) & 0x3U) == 0U); i += 4U) {
@@ -393,23 +405,34 @@ flash_status_t flash_program_bytes(uint32_t addr,
             ((uint32_t)data[i + 2] << 16) |
             ((uint32_t)data[i + 3] << 24);
         s = flash_program_word(addr + i, w);
-        if (s != FLASH_OK) return s;
+        if (s != FLASH_OK) {
+            flash_lock();
+            return s;
+        }
         if ((i & 0xFFU) == 0U) iwdg_kick();
     }
 
     /* Byte phase for the unaligned tail. */
     for (; i < size; ++i) {
         s = wait_busy();
-        if (s != FLASH_OK) return s;
+        if (s != FLASH_OK) {
+            flash_lock();
+            return s;
+        }
         FLASH_CR = (FLASH_CR & ~FLASH_CR_SER) | FLASH_CR_PG;
         *(volatile uint8_t *)(addr + i) = data[i];
         s = wait_busy();
         FLASH_CR &= ~FLASH_CR_PG;
-        if (s != FLASH_OK) return s;
+        if (s != FLASH_OK) {
+            flash_lock();
+            return s;
+        }
         if (*(volatile uint8_t *)(addr + i) != data[i]) {
+            flash_lock();
             return FLASH_ERR_VERIFY;
         }
     }
+    flash_lock();
     return FLASH_OK;
 }
 

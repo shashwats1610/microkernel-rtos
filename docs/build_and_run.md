@@ -20,6 +20,7 @@ bootloader + demo application. Two simulators are supported:
 | `make`                | GNU Make 4.0+        | apt / brew / chocolatey                                    |
 | `python`              | 3.10+                | https://python.org                                         |
 | `python -m pip install -r tools/requirements.txt` | latest | adds `ecdsa` and `pyserial` |
+| `hdiffi` (HPatchLite) | built from source    | https://github.com/sisong/HPatchLite — required for `make delta` |
 | Renode (optional)     | 1.14+                | https://renode.io (only needed for `stm32f4_discovery`)   |
 
 Run `make preflight` to verify the toolchain is in `PATH`.
@@ -120,11 +121,27 @@ required when switching.
 ## Tests
 
 ```bash
-make test                       # runs tests/run_all.py:
-                                #   - test_signature_python.py
-                                #   - test_signature.c (host-built C)
-                                #   - test_power_loss.py
-                                # Skips entries whose tools are missing.
+make test                       # runs tests/run_all.py (skips missing tools)
+make test STRICT=1              # fail if QEMU/gcc/build artifacts unavailable (CI)
+```
+
+Orchestrated tests:
+
+| Script | Requires |
+|--------|----------|
+| `test_signature_python.py` | Python + `ecdsa` |
+| `test_delta_common.py` | Python |
+| `test_signature.c` | Host gcc + `make all` + `make keys` |
+| `test_power_loss.py` | QEMU + `build/flash.bin` |
+| `test_recovery_ota.py` | QEMU + build artifacts |
+| `test_delta_ota.py` | QEMU + `hdiffi` + `make delta` |
+| `test_rollback.py` | QEMU + `make app_rollback` |
+
+## Delta patches
+
+```bash
+make delta                      # build/app_v1_signed.bin, app_v2_signed.bin, app_v1_to_v2.patch
+python tools/make_delta.py --compress tuz old.bin new.bin out.patch
 ```
 
 ## Updating the application

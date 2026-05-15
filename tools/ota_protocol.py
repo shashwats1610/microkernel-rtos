@@ -21,6 +21,7 @@ NAK         = 0x15
 OP_START    = 0x21
 OP_DATA     = 0x22
 OP_END      = 0x23
+OP_START_DELTA = 0x24
 OP_ABORT    = 0x2F
 
 MAX_PAYLOAD = 1024

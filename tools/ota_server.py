@@ -29,8 +29,14 @@ import sys
 import time
 from pathlib import Path
 
-# Local module
+# Local module (run from repo root: python tools/ota_server.py)
 import ota_protocol as ota
+
+try:
+    from delta_common import logical_signed_sha256, logical_signed_total_length
+except ImportError:
+    logical_signed_sha256 = None  # type: ignore[misc, assignment]
+    logical_signed_total_length = None  # type: ignore[misc, assignment]
 
 DEFAULT_TCP = "127.0.0.1:4444"
 DEFAULT_BAUD = 115200
@@ -203,12 +209,70 @@ def push(t: Transport, image: bytes, chunk_size: int) -> bool:
     return True
 
 
+def push_delta(
+    t: Transport,
+    patch: bytes,
+    old_signed: Path,
+    new_signed: Path,
+    chunk_size: int,
+) -> bool:
+    if logical_signed_sha256 is None or logical_signed_total_length is None:
+        sys.stderr.write("error: delta_common import failed\n")
+        return False
+
+    digest = logical_signed_sha256(old_signed)
+    expected_new = logical_signed_total_length(new_signed)
+    total = len(patch)
+    print(
+        f"Pushing DELTA patch {total} B -> expected new image {expected_new} B..."
+    )
+
+    seq = 1
+    payload = struct.pack("<II", total, expected_new) + digest
+    assert len(payload) == 40
+    if not send_with_retry(
+        t, ota.build_frame(ota.OP_START_DELTA, seq, payload), seq
+    ):
+        sys.stderr.write("\nfatal: START_DELTA failed after retries\n")
+        return False
+
+    sent = 0
+    t0 = time.monotonic()
+    while sent < total:
+        seq = (seq + 1) & 0xFFFF
+        chunk = patch[sent : sent + chunk_size]
+        if not send_with_retry(t, ota.build_frame(ota.OP_DATA, seq, chunk), seq):
+            sys.stderr.write(f"\nfatal: DATA frame seq={seq} failed\n")
+            return False
+        sent += len(chunk)
+        progress(seq, sent, total)
+    elapsed = time.monotonic() - t0
+    print(
+        f"\nDelta transfer complete in {elapsed:.2f}s "
+        f"({(sent / 1024.0) / elapsed:.1f} KiB/s)"
+    )
+
+    seq = (seq + 1) & 0xFFFF
+    end_ok = send_with_retry(t, ota.build_frame(ota.OP_END, seq), seq)
+    if not end_ok:
+        sys.stderr.write("fatal: END failed after retries\n")
+        return False
+
+    print("END acknowledged. Device should now reboot and swap slots.")
+    return True
+
+
 # ===================================================================== #
 # CLI                                                                     #
 # ===================================================================== #
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", type=Path, help="Signed firmware image")
+    parser.add_argument(
+        "image",
+        type=Path,
+        nargs="?",
+        help="Signed firmware image (full OTA), or patch.bin with --delta",
+    )
     parser.add_argument(
         "--tcp",
         default=DEFAULT_TCP,
@@ -224,7 +288,32 @@ def main() -> None:
         default=DEFAULT_CHUNK,
         help=f"DATA chunk size (default {DEFAULT_CHUNK})",
     )
+    parser.add_argument(
+        "--delta",
+        action="store_true",
+        help="Send a patch file (HPatchLite; uncompressed or tinyuz-compressed)",
+    )
+    parser.add_argument(
+        "--old-signed",
+        type=Path,
+        help="With --delta: signed image currently on the device (base for SHA-256)",
+    )
+    parser.add_argument(
+        "--new-signed",
+        type=Path,
+        help="With --delta: target signed image (length check vs patch output)",
+    )
     args = parser.parse_args()
+
+    if args.delta:
+        if args.image is None or args.old_signed is None or args.new_signed is None:
+            sys.stderr.write(
+                "error: --delta requires image (patch.bin), --old-signed, --new-signed\n"
+            )
+            sys.exit(2)
+    elif args.image is None:
+        sys.stderr.write("error: missing signed firmware image argument\n")
+        sys.exit(2)
 
     if not args.image.exists():
         sys.stderr.write(f"error: {args.image} does not exist\n")
@@ -235,7 +324,13 @@ def main() -> None:
         )
         sys.exit(1)
 
-    image = args.image.read_bytes()
+    if args.delta:
+        patch_blob = args.image.read_bytes()
+        if not args.old_signed.exists() or not args.new_signed.exists():
+            sys.stderr.write("error: --old-signed / --new-signed must exist\n")
+            sys.exit(1)
+    else:
+        patch_blob = args.image.read_bytes()
 
     if args.serial:
         print(f"Connecting to {args.serial} @ {args.baud}...")
@@ -250,7 +345,16 @@ def main() -> None:
         transport = TcpTransport(host, port)
 
     try:
-        ok = push(transport, image, args.chunk)
+        if args.delta:
+            ok = push_delta(
+                transport,
+                patch_blob,
+                args.old_signed,
+                args.new_signed,
+                args.chunk,
+            )
+        else:
+            ok = push(transport, patch_blob, args.chunk)
     finally:
         transport.close()
     sys.exit(0 if ok else 2)

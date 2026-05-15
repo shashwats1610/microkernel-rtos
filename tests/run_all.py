@@ -2,13 +2,12 @@
 
 Runs everything that can run in the current environment and reports a
 single pass/fail summary. Tests that require a missing tool (host C
-compiler, qemu-system-arm) are reported as SKIPPED rather than FAILED
-so the orchestrator is still useful in CI environments that only have
-some of the toolchain.
+compiler, qemu-system-arm) are reported as SKIPPED unless --strict is set.
 """
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
@@ -36,29 +35,43 @@ def host_cc() -> str | None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail if any integration test is skipped (QEMU, host gcc, build artifacts)",
+    )
+    args = parser.parse_args()
+
     failures = 0
     skipped = 0
 
-    # --- Python self-consistency tests ---
+    def skip(msg: str) -> None:
+        nonlocal skipped, failures
+        print(f"SKIP: {msg}")
+        skipped += 1
+        if args.strict:
+            print("STRICT: skip treated as failure")
+            failures += 1
+
     header("test_signature_python.py")
-    rc = run([sys.executable, str(ROOT / "tests" / "test_signature_python.py")])
-    if rc != 0:
+    if run([sys.executable, str(ROOT / "tests" / "test_signature_python.py")]) != 0:
         failures += 1
 
-    # --- Host C signature test (build + run) ---
+    header("test_delta_common.py")
+    if run([sys.executable, str(ROOT / "tests" / "test_delta_common.py")]) != 0:
+        failures += 1
+
     header("test_signature.c (host)")
     cc = host_cc()
     signed = ROOT / "build" / "app_signed.bin"
     pubkey = ROOT / "bootloader" / "include" / "public_key.h"
     if cc is None:
-        print("SKIP: no host C compiler (gcc/cc/clang) on PATH")
-        skipped += 1
+        skip("no host C compiler (gcc/cc/clang) on PATH")
     elif not signed.exists():
-        print(f"SKIP: {signed} missing; run 'make all' first")
-        skipped += 1
+        skip(f"{signed} missing; run 'make all' first")
     elif not pubkey.exists():
-        print(f"SKIP: {pubkey} missing; run 'make keys' first")
-        skipped += 1
+        skip(f"{pubkey} missing; run 'make keys' first")
     else:
         out = ROOT / "build" / "test_signature_host"
         if sys.platform.startswith("win"):
@@ -87,23 +100,23 @@ def main() -> int:
         ]
         if run(cmd, cwd=ROOT) != 0:
             failures += 1
-        else:
-            if run([str(out), str(signed)], cwd=ROOT) != 0:
-                failures += 1
+        elif run([str(out), str(signed)], cwd=ROOT) != 0:
+            failures += 1
 
-    # --- Power-loss test (requires QEMU) ---
-    header("test_power_loss.py")
-    rc = run([sys.executable, str(ROOT / "tests" / "test_power_loss.py")])
-    if rc != 0:
-        failures += 1
+    integration = [
+        ("test_power_loss.py", ROOT / "tests" / "test_power_loss.py"),
+        ("test_recovery_ota.py", ROOT / "tests" / "test_recovery_ota.py"),
+        ("test_delta_ota.py", ROOT / "tests" / "test_delta_ota.py"),
+        ("test_rollback.py", ROOT / "tests" / "test_rollback.py"),
+    ]
+    for label, script in integration:
+        header(label)
+        rc = run([sys.executable, str(script)])
+        if rc == 2:
+            skip(f"{label} skipped (missing toolchain or build)")
+        elif rc != 0:
+            failures += 1
 
-    # --- Recovery-mode OTA test (requires QEMU) ---
-    header("test_recovery_ota.py")
-    rc = run([sys.executable, str(ROOT / "tests" / "test_recovery_ota.py")])
-    if rc != 0:
-        failures += 1
-
-    # --- Summary ---
     print("\n" + "=" * 60)
     if failures == 0:
         print(f"ALL TESTS PASSED ({skipped} skipped)")

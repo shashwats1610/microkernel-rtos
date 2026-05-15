@@ -142,4 +142,13 @@ uint32_t flash_sector_size(uint32_t addr);
  */
 void *flash_get_ptr(uint32_t addr);
 
+/**
+ * @brief Span used for OTA/delta layout in the inactive slot.
+ *
+ * On QEMU_FLASH_SIM the SRAM shadow covers only the first 32 KB of each
+ * slot; tail-staged patches must be placed within that span. On hardware
+ * the full SLOT_SIZE is available.
+ */
+uint32_t flash_ota_slot_span(void);
+
 #endif /* FLASH_DRIVER_H */

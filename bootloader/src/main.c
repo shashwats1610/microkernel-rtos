@@ -21,6 +21,7 @@
 #include "bootloader.h"
 #include "config.h"
 #include "crypto.h"
+#include "firmware_format.h"
 #include "flash_driver.h"
 #include "iwdg.h"
 #include "memory_map.h"
@@ -39,9 +40,6 @@
 
 #define MAX_SWAP_RETRIES   4   /**< hard iteration cap; backstop only. */
 #define MAX_BOOT_ATTEMPTS  3   /**< if attempts > this, switch slot. */
-
-/* Forward decls for the shared-block + OTA helpers used here. */
-extern void shared_block_check_pending_ota(BootConfig_t *cfg);
 
 static void log_banner(const BootConfig_t *cfg)
 {
@@ -100,15 +98,7 @@ static void check_app_confirmation(BootConfig_t *cfg, bool *cfg_dirty)
 /* ===================================================================== */
 /* OTA-pending swap                                                        */
 /* ===================================================================== */
-/**
- * If `cfg->rollback_counter` was meant for downgrade prevention (left as
- * future work in this build), the check would happen here. Today this just
- * implements the swap+re-verify+revert logic.
- *
- * `cfg->ota_pending`-style state isn't a struct field in BootConfig_t (the
- * spec keeps it implicit by using SharedBootBlock.ota_pending). We treat
- * the SharedBootBlock ota_pending bit as the authoritative trigger.
- */
+/** Swap+re-verify+revert; bumps anti-downgrade state on success. */
 static void process_ota_pending_swap(BootConfig_t *cfg, bool *cfg_dirty)
 {
     if (SHARED_BOOT_BLOCK.ota_pending == 0U) {
@@ -137,6 +127,12 @@ static void process_ota_pending_swap(BootConfig_t *cfg, bool *cfg_dirty)
     /* Post-swap re-verify: defense against a transient read failure in the
      * window between the verify above and our about-to-jump path. */
     if (crypto_verify_firmware(memory_map_slot_addr(cfg->active_slot))) {
+        FirmwareHeader_t hdr;
+        if (flash_read(inactive_addr, (uint8_t *)&hdr, sizeof(hdr)) == FLASH_OK
+            && hdr.magic == FIRMWARE_MAGIC) {
+            boot_config_record_ota_to_slot(cfg, inactive, hdr.version);
+            *cfg_dirty = true;
+        }
         uart_log_printf("INFO: OTA swap committed; new active slot=%c\r\n",
                         (char)cfg->active_slot);
         return;
